@@ -1,0 +1,29 @@
+name: ci
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v3
+        with:
+          go-version: 'stable'
+      - uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+      - name: mod tidy check
+        run: .github/scripts/go-mod-tidy-check.sh
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v3
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: Test
+        run: |
+          go test ./... -count 1 -race -timeout 20m
