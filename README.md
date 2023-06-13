@@ -23,9 +23,9 @@ if err := aFunction(); err != nil {
 }
 
 if err := bFunction(); err != nil {
- // err could be ErrUserNotFound or another sentinel error,
- // use Wrap so errors.Is(err, ErrUserNotFound) works.
- return errutil.Wrap(err)
+    // err could be ErrUserNotFound or another sentinel error,
+    // use Wrap so errors.Is(err, ErrUserNotFound) works.
+    return errutil.Wrap(err)
 }
 ```
 
