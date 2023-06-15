@@ -40,6 +40,8 @@ type frameError struct {
 	err error
 }
 
+// NewFrameError enriches err with stack information from f and tags t.
+// If wrap is true, the returned error will implement Unwrap returning err.
 func NewFrameError(f Frame, t Tags, err error, wrap bool) error {
 	// pointer so equality comparison will work on a copied frameError.
 	e := &frameError{f, t, err}
@@ -59,24 +61,34 @@ func (e *frameError) Error() string {
 
 type Tags map[string]any
 
-// Will implement Unwrap. Preference should be given to With.
+// Wrap enriches err with stack information from the caller of Wrap.
+// The returned error will implement Unwrap (used by errors.Is/As)
+// returning err.
+//
+// Generally, Wrap should only be used when the returned error is
+// expected to be used with errors.Is or similar.
 func Wrap(err error) error {
 	return NewFrameError(Caller(1), nil, err, true)
 }
 
+// Wrapt is like Wrap but adds tags t to the error information.
 func Wrapt(err error, t Tags) error {
 	return NewFrameError(Caller(1), t, err, true)
 }
 
-// Will not implement Unwrap.
+// With enriches err with stack information from the caller of With.
+// The returned error will not implement Unwrap (used by errors.Is/As).
 func With(err error) error {
 	return NewFrameError(Caller(1), nil, err, false)
 }
 
+// Witht is like With but adds tags t to the error information.
 func Witht(err error, t Tags) error { //nolint:misspell
 	return NewFrameError(Caller(1), t, err, false)
 }
 
+// New returns a new error with stack information from the caller of New
+// and tags t.
 func New(t Tags) error {
 	return NewFrameError(Caller(1), t, nil, false)
 }
