@@ -176,9 +176,11 @@ func TestIs_wrapped(t *testing.T) {
 	target := errutil.New(errutil.Tags{"some": "tag"})
 
 	errs := map[string]error{
-		"wrap":        errutil.Wrap(target),
-		"wrap tags":   errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
-		"double wrap": errutil.Wrap(errutil.Wrap(target)),
+		"wrap":              errutil.Wrap(target),
+		"wrap allowed":      errutil.Wrap(target, target),
+		"wrap tags":         errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
+		"wrap tags allowed": errutil.Wrapt(target, errutil.Tags{"some": "tag"}, target),
+		"double wrap":       errutil.Wrap(errutil.Wrap(target)),
 	}
 
 	for n, err := range errs {
@@ -187,6 +189,11 @@ func TestIs_wrapped(t *testing.T) {
 				t.Fatal("expected true")
 			}
 		})
+	}
+
+	err := errutil.Wrap(target, errors.New("not allowed"))
+	if errors.Is(err, target) {
+		t.Fatal("should not be allowed")
 	}
 }
 

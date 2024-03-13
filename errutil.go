@@ -1,6 +1,7 @@
 package errutil
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
@@ -63,17 +64,29 @@ type Tags map[string]any
 
 // Wrap enriches err with stack information from the caller of Wrap.
 // The returned error will implement Unwrap (used by errors.Is/As)
-// returning err.
+// returning err. Unwrap will only work for allowed, or all if not given.
 //
 // Generally, Wrap should only be used when the returned error is
 // expected to be used with errors.Is or similar.
-func Wrap(err error) error {
-	return NewFrameError(Caller(1), nil, err, true)
+func Wrap(err error, allowed ...error) error {
+	return wrap(err, nil, allowed...)
 }
 
 // Wrapt is like Wrap but adds tags t to the error information.
-func Wrapt(err error, t Tags) error {
-	return NewFrameError(Caller(1), t, err, true)
+func Wrapt(err error, t Tags, allowed ...error) error {
+	return wrap(err, t, allowed...)
+}
+
+func wrap(err error, t Tags, allowed ...error) error {
+	if len(allowed) == 0 {
+		return NewFrameError(Caller(2), t, err, true)
+	}
+	for _, a := range allowed {
+		if errors.Is(err, a) {
+			return NewFrameError(Caller(2), t, err, true)
+		}
+	}
+	return NewFrameError(Caller(2), t, err, false)
 }
 
 // With enriches err with stack information from the caller of With.
