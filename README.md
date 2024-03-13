@@ -54,5 +54,4 @@ if err := topOfCalls(); err != nil {
 
 ## Future improvements
 
-* Wrapping only specific errors. Currently `With` masks underlying wraps and `Wrap` lets them all through.
 * Garbage reduction. Currently we maintain pointer equality in the same vein as `errors.New` as developers likely expect, however it requires heap allocation. This only shows up however in very fast loops.
