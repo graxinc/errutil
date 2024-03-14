@@ -112,13 +112,13 @@ errutil/test/dot.pkg dot.pkg.go:26 StdlibWitht
 errutil/test/dot.pkg dot.pkg.go:26 StdlibWitht
 	msg=regular`,
 		},
-		"AnonymousFunc": {
+		"AnonymousFunc": { // ends up inlining the dot.pkg.AnonymousFunc frame.
 			dotpkg.AnonymousFunc(),
 			errutil.Stack{
-				{Pkg: "errutil/test/dot.pkg", Func: "AnonymousFunc.func1.1", File: "dot.pkg.go", Line: 33, Values: errutil.Tags{"k1": true}},
+				{Pkg: "errutil_test", Func: "TestBuildStack.AnonymousFunc.func2.1", File: "dot.pkg.go", Line: 33, Values: errutil.Tags{"k1": true}},
 			},
 			`
-errutil/test/dot.pkg dot.pkg.go:33 AnonymousFunc.func1.1
+errutil_test dot.pkg.go:33 TestBuildStack.AnonymousFunc.func2.1
 	k1=true`,
 		},
 		"AnonymousValue": {
@@ -176,9 +176,11 @@ func TestIs_wrapped(t *testing.T) {
 	target := errutil.New(errutil.Tags{"some": "tag"})
 
 	errs := map[string]error{
-		"wrap":        errutil.Wrap(target),
-		"wrap tags":   errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
-		"double wrap": errutil.Wrap(errutil.Wrap(target)),
+		"wrap":              errutil.Wrap(target),
+		"wrap allowed":      errutil.Wrap(target, target),
+		"wrap tags":         errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
+		"wrap tags allowed": errutil.Wrapt(target, errutil.Tags{"some": "tag"}, target),
+		"double wrap":       errutil.Wrap(errutil.Wrap(target)),
 	}
 
 	for n, err := range errs {
@@ -187,6 +189,11 @@ func TestIs_wrapped(t *testing.T) {
 				t.Fatal("expected true")
 			}
 		})
+	}
+
+	err := errutil.Wrap(target, errors.New("not allowed"))
+	if errors.Is(err, target) {
+		t.Fatal("should not be allowed")
 	}
 }
 
