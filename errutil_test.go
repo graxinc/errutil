@@ -35,7 +35,7 @@ func TestCaller(t *testing.T) {
 	if fileName != "dot.pkg.go" {
 		t.Fatal(fileName)
 	}
-	if line != 54 {
+	if line != 65 {
 		t.Fatal(line)
 	}
 }
@@ -55,7 +55,7 @@ func TestCallerDefer(t *testing.T) {
 	if fileName != "dot.pkg.go" {
 		t.Fatal(fileName)
 	}
-	if line != 59 {
+	if line != 70 {
 		t.Fatal(line)
 	}
 }
@@ -149,6 +149,35 @@ errutil/test/dot.pkg dot.pkg.go:47 PkgFuncs
 errutil/test/dot.pkg dot.pkg.go:46 PkgFuncs
 	k1=v1`,
 		},
+		"WithStack": {
+			dotpkg.WithStack(),
+			errutil.Stack{
+				{Pkg: "errutil_test", Func: "TestBuildStack", File: "errutil_test.go", Line: 153},
+				{Pkg: "errutil/test/dot.pkg", Func: "WithStack", File: "dot.pkg.go", Line: 61},
+				{Pkg: "errutil/test/dot.pkg", Func: "WithStack", File: "dot.pkg.go", Line: 60, Values: errutil.Tags{"k2": "v2"}},
+				{Pkg: "errutil/test/dot.pkg", Func: "WithStack", File: "dot.pkg.go", Line: 59, Values: errutil.Tags{"k1": "v1"}},
+			},
+			`
+errutil_test errutil_test.go:153 TestBuildStack
+errutil/test/dot.pkg dot.pkg.go:61 WithStack
+errutil/test/dot.pkg dot.pkg.go:60 WithStack
+	k2=v2
+errutil/test/dot.pkg dot.pkg.go:59 WithStack
+	k1=v1`,
+		},
+		"StdlibWithStack": {
+			dotpkg.StdlibWithStack(),
+			errutil.Stack{
+				{Pkg: "errutil_test", Func: "TestBuildStack", File: "errutil_test.go", Line: 169},
+				{Pkg: "errutil/test/dot.pkg", Func: "StdlibWithStack", File: "dot.pkg.go", Line: 55},
+				{Pkg: "errutil/test/dot.pkg", Func: "StdlibWithStack", File: "dot.pkg.go", Line: 55, Values: errutil.Tags{"msg": "regular"}},
+			},
+			`
+errutil_test errutil_test.go:169 TestBuildStack
+errutil/test/dot.pkg dot.pkg.go:55 StdlibWithStack
+errutil/test/dot.pkg dot.pkg.go:55 StdlibWithStack
+	msg=regular`,
+		},
 	}
 
 	for n, c := range cases {
@@ -231,11 +260,11 @@ func TestBaser(t *testing.T) {
 	got := errutil.BuildStack(err)
 
 	want := errutil.Stack{
-		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 98},
-		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 98, Values: errutil.Tags{"type": "dotpkg.BaserParentError"}},
-		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 96},
-		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 96, Values: errutil.Tags{"msg": "the field", "type": "dotpkg.BaserError"}},
-		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 94, Values: errutil.Tags{"a": 1}},
+		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 109},
+		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 109, Values: errutil.Tags{"type": "dotpkg.BaserParentError"}},
+		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 107},
+		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 107, Values: errutil.Tags{"msg": "the field", "type": "dotpkg.BaserError"}},
+		{Pkg: "errutil/test/dot.pkg", Func: "Baser", File: "dot.pkg.go", Line: 105, Values: errutil.Tags{"a": 1}},
 	}
 	if d := cmp.Diff(want, got); d != "" {
 		t.Fatal(d)
