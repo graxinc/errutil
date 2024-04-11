@@ -108,6 +108,26 @@ func New(t Tags) error {
 	return NewFrameError(Caller(1), t, nil, false)
 }
 
+// WithStack returns a new error with complete stack information from
+// the caller of WithStack.
+//
+// This is useful in cases where errors aren't or can't be created and
+// passed around, such as when recovering from panics.
+func WithStack(err error) error {
+	frames := callers(1)
+	if len(frames) <= 1 {
+		return NewFrameError(frames[0], nil, err, false)
+	}
+	for _, f := range frames {
+		pkg, _, _, _ := f.Location()
+		if pkg == "" {
+			continue
+		}
+		err = NewFrameError(f, nil, err, false)
+	}
+	return err
+}
+
 type Frame struct {
 	pcs [4]uintptr
 }
@@ -117,6 +137,17 @@ func Caller(skip int) Frame {
 	var s Frame
 	runtime.Callers(skip+2, s.pcs[:]) // +2 since Callers gives here passing 1, not 0.
 	return s
+}
+
+// callers(0) returns the frames starting from the caller of Caller.
+func callers(skip int) []Frame {
+	var pcs [64]uintptr
+	n := runtime.Callers(skip+2, pcs[:]) // +2 since Callers gives here passing 1, not 0.
+	var frames []Frame
+	for i := 0; i < n; i++ {
+		frames = append(frames, Frame{pcs: [4]uintptr{pcs[i]}})
+	}
+	return frames
 }
 
 func (f Frame) Location() (pkg, fn, fileName string, line int) {

@@ -50,6 +50,17 @@ func PkgFuncs() error {
 	return errutil.Wrap(err)
 }
 
+func StdlibWithStack() error {
+	err := errors.New("regular")
+	return errutil.WithStack(err)
+}
+
+func WithStack() error {
+	err := errutil.New(errutil.Tags{"k1": "v1"})
+	err = errutil.Witht(err, errutil.Tags{"k2": "v2"})
+	return errutil.WithStack(err)
+}
+
 func Caller() errutil.Frame {
 	return errutil.Caller(0)
 }
