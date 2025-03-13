@@ -29,6 +29,7 @@ type unwraper interface {
 
 type wrapError struct {
 	*frameError
+	mode WrapMode
 }
 
 func (e wrapError) Unwrap() error {
@@ -41,15 +42,41 @@ type frameError struct {
 	err error
 }
 
+type WrapMode byte
+
+const (
+	Basic WrapMode = 1
+	Super WrapMode = 2
+)
+
 // NewFrameError enriches err with stack information from f and tags t.
-// If wrap is true, the returned error will implement Unwrap returning err.
-func NewFrameError(f Frame, t Tags, err error, wrap bool) error {
+// If mode is not zero, the returned error will implement Unwrap returning err.
+func NewFrameError(f Frame, t Tags, err error, mode WrapMode) error {
 	// pointer so equality comparison will work on a copied frameError.
 	e := &frameError{f, t, err}
-	if wrap {
-		return wrapError{e}
+	if mode != 0 {
+		return wrapError{e, mode}
 	}
 	return e
+}
+
+func (e *frameError) Unwrap() []error {
+	var c any = e
+	var errs []error
+	for c != nil {
+		if e, ok := c.(wrapError); ok {
+			if e.mode == Super {
+				errs = append(errs, e.err)
+			}
+			c = e.err
+		}
+		if e, ok := c.(*frameError); ok {
+			c = e.err
+		} else {
+			c = nil
+		}
+	}
+	return errs
 }
 
 func (e *frameError) Base() error {
@@ -71,41 +98,49 @@ type Tags map[string]any
 // expected to be used with errors.Is or similar. Non-sentinel
 // errors can implement errors.Is to be used with allowed.
 func Wrap(err error, allowed ...error) error {
-	return wrap(err, nil, allowed...)
+	return wrap(err, Basic, nil, allowed...)
 }
 
 // Wrapt is like Wrap but adds tags t to the error information.
 func Wrapt(err error, t Tags, allowed ...error) error {
-	return wrap(err, t, allowed...)
+	return wrap(err, Basic, t, allowed...)
 }
 
-func wrap(err error, t Tags, allowed ...error) error {
+func SuperWrap(err error, allowed ...error) error {
+	return wrap(err, Super, nil, allowed...)
+}
+
+func SuperWrapt(err error, t Tags, allowed ...error) error {
+	return wrap(err, Super, t, allowed...)
+}
+
+func wrap(err error, mode WrapMode, t Tags, allowed ...error) error {
 	if len(allowed) == 0 {
-		return NewFrameError(Caller(2), t, err, true)
+		return NewFrameError(Caller(2), t, err, mode)
 	}
 	for _, a := range allowed {
 		if errors.Is(err, a) {
-			return NewFrameError(Caller(2), t, err, true)
+			return NewFrameError(Caller(2), t, err, mode)
 		}
 	}
-	return NewFrameError(Caller(2), t, err, false)
+	return NewFrameError(Caller(2), t, err, 0)
 }
 
 // With enriches err with stack information from the caller of With.
 // The returned error will not implement Unwrap (used by errors.Is/As).
 func With(err error) error {
-	return NewFrameError(Caller(1), nil, err, false)
+	return NewFrameError(Caller(1), nil, err, 0)
 }
 
 // Witht is like With but adds tags t to the error information.
 func Witht(err error, t Tags) error { //nolint:misspell
-	return NewFrameError(Caller(1), t, err, false)
+	return NewFrameError(Caller(1), t, err, 0)
 }
 
 // New returns a new error with stack information from the caller of New
 // and tags t.
 func New(t Tags) error {
-	return NewFrameError(Caller(1), t, nil, false)
+	return NewFrameError(Caller(1), t, nil, 0)
 }
 
 // WithStack returns a new error with complete stack information from
@@ -116,14 +151,14 @@ func New(t Tags) error {
 func WithStack(err error) error {
 	frames := callers(1)
 	if len(frames) <= 1 {
-		return NewFrameError(frames[0], nil, err, false)
+		return NewFrameError(frames[0], nil, err, 0)
 	}
 	for _, f := range frames {
 		pkg, _, _, _ := f.Location()
 		if pkg == "" {
 			continue
 		}
-		err = NewFrameError(f, nil, err, false)
+		err = NewFrameError(f, nil, err, 0)
 	}
 	return err
 }
@@ -281,14 +316,14 @@ func BuildStack(err error) Stack {
 
 		stack = append(stack, sf)
 
-		switch b := err.(type) {
-		case unwraper:
-			err = b.Unwrap()
-		case Baser:
-			err = b.Base()
-		default:
-			err = nil
+		var candErr error
+		if u, ok := err.(unwraper); ok {
+			candErr = u.Unwrap()
 		}
+		if b, ok := err.(Baser); ok && candErr == nil {
+			candErr = b.Base()
+		}
+		err = candErr
 	}
 
 	return stack

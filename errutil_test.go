@@ -199,23 +199,32 @@ errutil/test/dot.pkg dot.pkg.go:55 StdlibWithStack
 	}
 }
 
-func TestIs_wrapped(t *testing.T) {
+func TestIs_with_wrap(t *testing.T) {
 	t.Parallel()
 
 	run := func(t *testing.T, err, target error, allowed ...error) {
-		errs := map[string]error{
-			"wrap":                errutil.Wrap(target),
-			"wrap allowed":        errutil.Wrap(err, allowed...),
-			"double wrap allowed": errutil.Wrap(errutil.Wrap(err, allowed...), allowed...),
-			"wrap tags":           errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
-			"wrap tags allowed":   errutil.Wrapt(target, errutil.Tags{"some": "tag"}, target),
-			"double wrap":         errutil.Wrap(errutil.Wrap(target)),
+		cases := map[string]struct {
+			err  error
+			want bool
+		}{
+			"wrap":                {errutil.Wrap(target), true},
+			"wrap allowed":        {errutil.Wrap(err, allowed...), true},
+			"double wrap allowed": {errutil.Wrap(errutil.Wrap(err, allowed...), allowed...), true},
+			"wrap tags":           {errutil.Wrapt(target, errutil.Tags{"some": "tag"}), true},
+			"wrap tags allowed":   {errutil.Wrapt(target, errutil.Tags{"some": "tag"}, target), true},
+			"double wrap":         {errutil.Wrap(errutil.Wrap(target)), true},
+			"with":                {errutil.With(target), false},
+			"with wrap":           {errutil.With(errutil.Wrap(target)), false},
+			"superwrap":           {errutil.SuperWrap(target), true},
+			"with superwrap":      {errutil.With(errutil.SuperWrap(target)), true},
+			"with with superwrap": {errutil.With(errutil.With(errutil.SuperWrap(target))), true},
+			"wrap superwrap":      {errutil.Wrap(errutil.SuperWrap(target)), true},
 		}
 
-		for n, err := range errs {
+		for n, c := range cases {
 			t.Run(n, func(t *testing.T) {
-				if !errors.Is(err, target) {
-					t.Fatal("expected true")
+				if got := errors.Is(c.err, target); got != c.want {
+					t.Fatalf("got %v, want %v", got, c.want)
 				}
 				notTarget := errors.New("not target")
 				if errors.Is(err, notTarget) {
