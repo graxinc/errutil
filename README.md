@@ -16,16 +16,70 @@ Minimal functionality leads to:
 
 The `Wrap` methods additionally wrap passed errors so `errors.Is` matches the original error. To understand when `Wrap` should be used instead of `With`, read the [Whether to Wrap](https://go.dev/blog/go1.13-errors#whether-to-wrap) section of the Go 1.13 errors blog post.
 
-Function calls should look similar to:
+Functions that do not expose Is/As errors as part of their contract, should look similar to:
 ```
-if err := aFunction(); err != nil {
+func aFunc() error {
+    ...
     return errutil.With(err)
 }
+```
 
-if err := bFunction(); err != nil {
-    // err could be ErrUserNotFound or another sentinel error,
-    // use Wrap so errors.Is(err, ErrUserNotFound) works.
+Wrapping sentinel errors, should look similar to:
+```
+var ErrNotFound = errors.New("not found")
+
+...
+func aFunc() error {
+    if err := bFunc(); err != nil {
+        return errutil.Wrap(err, ErrNotFound)
+    }
+    ...
+}
+
+if err := aFunc(); err != nil {
+    if errors.Is(err, ErrNotFound) {
+        // handle not found case
+    }
+    ...
+}
+```
+
+Wrapping unknown errors (discouraged), should look similar to:
+```
+if err := aFunc(); err != nil {
     return errutil.Wrap(err)
+}
+```
+
+Wrapping custom errors that are not sentinels, should look similar to:
+```
+type CustomError struct {
+    Text string
+}
+
+func (e CustomError) Error() string {
+    return "text: " + e.Text
+}
+
+var ErrCustom = &CustomError{}
+
+func (CustomError) Is(target error) bool {
+    return target == ErrCustom
+}
+
+func aFunc() error {
+    if err := bFunc(); err != nil {
+        return errutil.Wrap(err, ErrCustom)
+    }
+    ... 
+}
+
+if err := aFunc(); err != nil {
+    var cErr CustomError
+    if errors.As(err, &cErr) {
+        // use cErr.Text
+    }
+    ...
 }
 ```
 
@@ -33,11 +87,11 @@ Custom errors should implement Baser or errors.Unwrap to maintain traces, simila
 ```
 type CustomError struct {
     Err error
-    Field string
+    Text string
 }
 
 func (e CustomError) Error() string {
-    return "field: " + e.Field
+    return "text: " + e.Text
 }
 
 func (e CustomError) Base() error {

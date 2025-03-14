@@ -108,3 +108,15 @@ func Baser() error {
 	err4 := BaserParentError{err3}
 	return errutil.Wrap(err4)
 }
+
+type CustomError struct {
+	Text string
+}
+
+func (c CustomError) Error() string { return c.Text }
+
+var ErrCustom = &CustomError{}
+
+func (CustomError) Is(target error) bool {
+	return target == ErrCustom
+}

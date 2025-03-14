@@ -112,13 +112,13 @@ errutil/test/dot.pkg dot.pkg.go:26 StdlibWitht
 errutil/test/dot.pkg dot.pkg.go:26 StdlibWitht
 	msg=regular`,
 		},
-		"AnonymousFunc": { // ends up inlining the dot.pkg.AnonymousFunc frame.
+		"AnonymousFunc": {
 			dotpkg.AnonymousFunc(),
 			errutil.Stack{
-				{Pkg: "errutil_test", Func: "TestBuildStack.AnonymousFunc.func2.1", File: "dot.pkg.go", Line: 33, Values: errutil.Tags{"k1": true}},
+				{Pkg: "errutil/test/dot.pkg", Func: "AnonymousFunc.AnonymousFunc.func1.func2", File: "dot.pkg.go", Line: 33, Values: errutil.Tags{"k1": true}},
 			},
 			`
-errutil_test dot.pkg.go:33 TestBuildStack.AnonymousFunc.func2.1
+errutil/test/dot.pkg dot.pkg.go:33 AnonymousFunc.AnonymousFunc.func1.func2
 	k1=true`,
 		},
 		"AnonymousValue": {
@@ -202,28 +202,51 @@ errutil/test/dot.pkg dot.pkg.go:55 StdlibWithStack
 func TestIs_wrapped(t *testing.T) {
 	t.Parallel()
 
-	target := errutil.New(errutil.Tags{"some": "tag"})
+	run := func(t *testing.T, err, target error, allowed ...error) {
+		errs := map[string]error{
+			"wrap":                errutil.Wrap(target),
+			"wrap allowed":        errutil.Wrap(err, allowed...),
+			"double wrap allowed": errutil.Wrap(errutil.Wrap(err, allowed...), allowed...),
+			"wrap tags":           errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
+			"wrap tags allowed":   errutil.Wrapt(target, errutil.Tags{"some": "tag"}, target),
+			"double wrap":         errutil.Wrap(errutil.Wrap(target)),
+		}
 
-	errs := map[string]error{
-		"wrap":              errutil.Wrap(target),
-		"wrap allowed":      errutil.Wrap(target, target),
-		"wrap tags":         errutil.Wrapt(target, errutil.Tags{"some": "tag"}),
-		"wrap tags allowed": errutil.Wrapt(target, errutil.Tags{"some": "tag"}, target),
-		"double wrap":       errutil.Wrap(errutil.Wrap(target)),
+		for n, err := range errs {
+			t.Run(n, func(t *testing.T) {
+				if !errors.Is(err, target) {
+					t.Fatal("expected true")
+				}
+				notTarget := errors.New("not target")
+				if errors.Is(err, notTarget) {
+					t.Fatal("expected false")
+				}
+				notTarget = dotpkg.CustomError{}
+				if errors.Is(err, notTarget) {
+					t.Fatal("expected false")
+				}
+			})
+		}
+
+		err = errutil.Wrap(err, errors.New("not allowed"))
+		if errors.Is(err, target) {
+			t.Fatal("should not be allowed")
+		}
 	}
-
-	for n, err := range errs {
-		t.Run(n, func(t *testing.T) {
-			if !errors.Is(err, target) {
-				t.Fatal("expected true")
-			}
+	t.Run("New", func(t *testing.T) {
+		err := errutil.New(errutil.Tags{"some": "tag"})
+		run(t, err, err)
+	})
+	t.Run("CustomError", func(t *testing.T) {
+		t.Run("struct", func(t *testing.T) {
+			err := dotpkg.CustomError{Text: "something"}
+			run(t, err, dotpkg.ErrCustom, dotpkg.ErrCustom)
 		})
-	}
-
-	err := errutil.Wrap(target, errors.New("not allowed"))
-	if errors.Is(err, target) {
-		t.Fatal("should not be allowed")
-	}
+		t.Run("pointer", func(t *testing.T) {
+			err := &dotpkg.CustomError{Text: "something"}
+			run(t, err, dotpkg.ErrCustom, dotpkg.ErrCustom)
+		})
+	})
 }
 
 func TestIs_self(t *testing.T) {
