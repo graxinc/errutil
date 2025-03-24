@@ -115,7 +115,7 @@ type CustomError struct {
 
 func (c CustomError) Error() string { return c.Text }
 
-var ErrCustom = &CustomError{}
+var ErrCustom = errors.New("custom error")
 
 func (CustomError) Is(target error) bool {
 	return target == ErrCustom
