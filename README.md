@@ -61,7 +61,8 @@ func (e CustomError) Error() string {
     return "text: " + e.Text
 }
 
-var ErrCustom = &CustomError{} // Must use a pointer to avoid accidental matches
+// Must use a pointer to avoid accidental matches. Does not need to be the same type as CustomError.
+var ErrCustom = errors.New("custom error")
 
 func (CustomError) Is(target error) bool {
     return target == ErrCustom
