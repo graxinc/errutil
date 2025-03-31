@@ -61,18 +61,18 @@ func NewFrameError(f Frame, t Tags, err error, mode WrapMode) error {
 }
 
 func (e *frameError) Unwrap() []error {
-	var c any = e
+	var c error = e
 	var errs []error
 	for c != nil {
-		if e, ok := c.(wrapError); ok {
-			if e.mode == Super {
-				errs = append(errs, e.err)
-			}
-			c = e.err
+		if e, ok := c.(wrapError); ok && e.mode == Super {
+			errs = append(errs, e.err)
 		}
-		if e, ok := c.(*frameError); ok {
-			c = e.err
-		} else {
+		switch ce := c.(type) {
+		case unwraper:
+			c = ce.Unwrap()
+		case Baser:
+			c = ce.Base()
+		default:
 			c = nil
 		}
 	}
@@ -316,14 +316,14 @@ func BuildStack(err error) Stack {
 
 		stack = append(stack, sf)
 
-		var candErr error
-		if u, ok := err.(unwraper); ok {
-			candErr = u.Unwrap()
+		switch b := err.(type) {
+		case unwraper:
+			err = b.Unwrap()
+		case Baser:
+			err = b.Base()
+		default:
+			err = nil
 		}
-		if b, ok := err.(Baser); ok && candErr == nil {
-			candErr = b.Base()
-		}
-		err = candErr
 	}
 
 	return stack

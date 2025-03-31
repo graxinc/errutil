@@ -207,6 +207,7 @@ func TestIs_with_wrap(t *testing.T) {
 			err  error
 			want bool
 		}{
+			"with wrap superwrap": {errutil.With(errutil.Wrap(errutil.SuperWrap(target))), true},
 			"wrap":                {errutil.Wrap(target), true},
 			"wrap allowed":        {errutil.Wrap(err, allowed...), true},
 			"double wrap allowed": {errutil.Wrap(errutil.Wrap(err, allowed...), allowed...), true},
