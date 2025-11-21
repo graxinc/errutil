@@ -4,26 +4,34 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
-      - uses: golangci/golangci-lint-action@v3
+          go-version-file: go.mod
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.6.0
+          args: --timeout=10m
+
       - name: mod tidy check
-        run: .github/scripts/go-mod-tidy-check.sh
+        run: go mod tidy --diff
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macOS-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version-file: go.mod
           cache: true
+
       - name: Test
         run: |
           go test ./... -count 1 -race -timeout 20m
