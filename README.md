@@ -6,6 +6,7 @@
 
 While numerous error packages provide rich functionality, `errutil` is the minimal (opinionated) functionality GRAX needs for error traces.
 Minimal functionality leads to:
+
 * Consistent use through a codebase.
 * A faster implementation.
 * No assumptions to break. For example, when errors with meaning (UserNotFound) are offered.
@@ -17,7 +18,8 @@ Minimal functionality leads to:
 The `Wrap` methods additionally wrap passed errors so `errors.Is` matches the original error. To understand when `Wrap` should be used instead of `With`, read the [Whether to Wrap](https://go.dev/blog/go1.13-errors#whether-to-wrap) section of the Go 1.13 errors blog post.
 
 Functions that do not expose Is/As errors as part of their contract, should look similar to:
-```
+
+```go
 func aFunc() error {
     ...
     return errutil.With(err)
@@ -25,7 +27,8 @@ func aFunc() error {
 ```
 
 Wrapping sentinel errors, should look similar to:
-```
+
+```go
 var ErrNotFound = errors.New("not found")
 
 ...
@@ -45,14 +48,16 @@ if err := aFunc(); err != nil {
 ```
 
 Wrapping unknown errors (discouraged), should look similar to:
-```
+
+```go
 if err := aFunc(); err != nil {
     return errutil.Wrap(err)
 }
 ```
 
 Wrapping custom errors that are not sentinels, should look similar to:
-```
+
+```go
 type CustomError struct {
     Text string
 }
@@ -85,7 +90,8 @@ if err := aFunc(); err != nil {
 ```
 
 Custom errors should implement Baser or errors.Unwrap to maintain traces, similar to:
-```
+
+```go
 type CustomError struct {
     Err error
     Text string
@@ -101,7 +107,8 @@ func (e CustomError) Base() error {
 ```
 
 Simple logging could be done with:
-```
+
+```go
 if err := topOfCalls(); err != nil {
     log.Println(errutil.BuildStack(err))
 }
