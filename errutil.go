@@ -3,14 +3,14 @@ package errutil
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"path"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
-
-	"golang.org/x/exp/maps"
 )
 
 // ImportPrefix strips off pkgs when formatting, to shorten.
@@ -225,7 +225,7 @@ func (f StackFrame) String() string {
 	locationLine := strings.Join(locationParts, " ")
 
 	var contextPairs []string
-	keys := maps.Keys(f.Values)
+	keys := slices.Collect(maps.Keys(f.Values))
 	sort.Strings(keys)
 	for _, k := range keys {
 		contextPairs = append(contextPairs, k+"="+tagValue(f.Values[k]))
