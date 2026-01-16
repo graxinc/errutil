@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
-	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
+	"golang.org/x/tools/go/ssa"
 )
 
 const errUtilPkg = "github.com/graxinc/errutil"
@@ -19,113 +19,161 @@ func Analyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
 		Name:     "errwrap",
 		Doc:      "check that errors are wrapped with errutil.With or errutil.Wrap",
-		Requires: []*analysis.Analyzer{inspect.Analyzer},
+		Requires: []*analysis.Analyzer{buildssa.Analyzer},
 		Run:      run,
 	}
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-	if !ok {
-		return nil, nil
+	ssaInfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+
+	// Collect all functions including anonymous ones, using a worklist algorithm
+	seen := make(map[*ssa.Function]bool)
+	worklist := append([]*ssa.Function{}, ssaInfo.SrcFuncs...)
+
+	// Include package-level function members (handles function literals in var initializers)
+	if ssaInfo.Pkg != nil {
+		for _, mem := range ssaInfo.Pkg.Members {
+			if fn, ok := mem.(*ssa.Function); ok {
+				worklist = append(worklist, fn)
+			}
+		}
 	}
 
-	insp.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)}, func(n ast.Node) {
-		var fnType *ast.FuncType
-		var body *ast.BlockStmt
-		var funcPos token.Pos
-		switch fn := n.(type) {
-		case *ast.FuncDecl:
-			if fn.Body == nil {
-				return
-			}
-			fnType, body, funcPos = fn.Type, fn.Body, fn.Pos()
-		case *ast.FuncLit:
-			fnType, body, funcPos = fn.Type, fn.Body, fn.Pos()
+	for len(worklist) > 0 {
+		fn := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+		if fn == nil || seen[fn] {
+			continue
 		}
-
-		file := fileForPos(pass, funcPos)
-		if file == nil || isFileNolint(file) || isNolintNear(file, pass.Fset, funcPos) {
-			return
-		}
-
-		errIndices, namedErrVars := errorReturnInfo(pass, fnType)
-		if len(errIndices) == 0 {
-			return
-		}
-
-		// Find unwrapped assignments to named error variables
-		unwrappedAssignments := findUnwrappedAssignments(pass, body, namedErrVars)
-
-		ast.Inspect(body, func(n ast.Node) bool {
-			if _, ok := n.(*ast.FuncLit); ok {
-				return false
-			}
-			ret, ok := n.(*ast.ReturnStmt)
-			if !ok {
-				return true
-			}
-
-			// Handle bare return (no explicit results)
-			if len(ret.Results) == 0 && len(namedErrVars) > 0 {
-				// Report all unwrapped assignments before this return (conservative approach
-				// since we don't do control flow analysis)
-				if !isNolintNear(file, pass.Fset, ret.Pos()) {
-					for _, pos := range unwrappedAssignments {
-						if pos < ret.Pos() {
-							pass.Reportf(ret.Pos(), "bare return with named error return; error assigned at line %d should be wrapped",
-								pass.Fset.Position(pos).Line)
-						}
-					}
-				}
-				return true
-			}
-
-			// Handle explicit return values
-			for _, idx := range errIndices {
-				if idx < len(ret.Results) && !isWrapped(pass, ret.Results[idx]) && !isNolintNear(file, pass.Fset, ret.Results[idx].Pos()) {
-					pass.Reportf(ret.Results[idx].Pos(), "error should be wrapped with errutil.With or errutil.Wrap")
-				}
-			}
-			return true
-		})
-	})
+		seen[fn] = true
+		checkFunction(pass, fn)
+		worklist = append(worklist, fn.AnonFuncs...)
+	}
 
 	return nil, nil
 }
 
-// findUnwrappedAssignments finds assignments to named error variables that are not wrapped.
-func findUnwrappedAssignments(pass *analysis.Pass, body *ast.BlockStmt, namedErrVars []string) []token.Pos {
-	if len(namedErrVars) == 0 {
-		return nil
+func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
+	// Check for file-level or function-level nolint
+	if fn.Syntax() == nil {
+		return
+	}
+	file := fileForPos(pass, fn.Pos())
+	if file == nil || isFileNolint(file) || isNolintNear(file, pass.Fset, fn.Pos()) {
+		return
 	}
 
-	varSet := make(map[string]struct{}, len(namedErrVars))
-	for _, name := range namedErrVars {
-		varSet[name] = struct{}{}
+	// Check if function returns error
+	sig := fn.Signature
+	results := sig.Results()
+	if results == nil {
+		return
 	}
 
-	var positions []token.Pos
-	ast.Inspect(body, func(n ast.Node) bool {
-		if _, ok := n.(*ast.FuncLit); ok {
-			return false // Don't descend into nested function literals
+	// Find which result indices are errors
+	var errIndices []int
+	for i := range results.Len() {
+		if isErrorType(results.At(i).Type()) {
+			errIndices = append(errIndices, i)
 		}
-		assign, ok := n.(*ast.AssignStmt)
-		if !ok {
-			return true
-		}
-		for i, lhs := range assign.Lhs {
-			ident, ok := lhs.(*ast.Ident)
+	}
+	if len(errIndices) == 0 {
+		return
+	}
+
+	// Analyze each basic block for return instructions
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			ret, ok := instr.(*ssa.Return)
 			if !ok {
 				continue
 			}
-			if _, isErrVar := varSet[ident.Name]; isErrVar && i < len(assign.Rhs) && !isWrapped(pass, assign.Rhs[i]) {
-				positions = append(positions, assign.Pos())
+
+			retPos := ret.Pos()
+			if !retPos.IsValid() {
+				continue
+			}
+			if isNolintNear(file, pass.Fset, retPos) {
+				continue
+			}
+
+			// Check each error return value
+			for _, idx := range errIndices {
+				if idx >= len(ret.Results) {
+					continue
+				}
+				if !isWrapped(ret.Results[idx], make(map[ssa.Value]bool)) {
+					pass.Reportf(retPos, "error should be wrapped with errutil.With or errutil.Wrap")
+				}
+			}
+		}
+	}
+}
+
+// isWrapped returns true if the value is properly wrapped (nil or from errutil).
+func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
+	if v == nil || visited[v] {
+		return v == nil
+	}
+	visited[v] = true
+
+	switch val := v.(type) {
+	case *ssa.Const:
+		return val.IsNil()
+
+	case *ssa.Call:
+		return isErrUtilCall(val)
+
+	case *ssa.Phi:
+		for _, edge := range val.Edges {
+			if !isWrapped(edge, visited) {
+				return false
 			}
 		}
 		return true
-	})
-	return positions
+
+	case *ssa.Extract:
+		switch tuple := val.Tuple.(type) {
+		case *ssa.Call:
+			return isErrUtilCall(tuple)
+		case *ssa.TypeAssert:
+			return isWrapped(tuple.X, visited)
+		}
+		return false
+
+	case *ssa.MakeInterface:
+		return isWrapped(val.X, visited)
+
+	case *ssa.ChangeInterface:
+		return isWrapped(val.X, visited)
+
+	case *ssa.UnOp:
+		return isWrapped(val.X, visited)
+
+	case *ssa.TypeAssert:
+		return isWrapped(val.X, visited)
+
+	default:
+		return false
+	}
+}
+
+// isErrUtilCall checks if an SSA Call instruction is a call to an errutil function.
+func isErrUtilCall(call *ssa.Call) bool {
+	callee := call.Call.StaticCallee()
+	if callee == nil {
+		return false
+	}
+	pkg := callee.Package()
+	if pkg == nil {
+		return false
+	}
+	return pkg.Pkg.Path() == errUtilPkg
+}
+
+func isErrorType(t types.Type) bool {
+	return types.Identical(t, types.Universe.Lookup("error").Type())
 }
 
 func fileForPos(pass *analysis.Pass, pos token.Pos) *ast.File {
@@ -163,47 +211,4 @@ func isNolintNear(f *ast.File, fset *token.FileSet, pos token.Pos) bool {
 		}
 	}
 	return false
-}
-
-// errorReturnInfo returns the indices of all error returns and the names of named error return variables.
-func errorReturnInfo(pass *analysis.Pass, fnType *ast.FuncType) (indices []int, namedVars []string) {
-	if fnType.Results == nil {
-		return nil, nil
-	}
-	idx := 0
-	for _, field := range fnType.Results.List {
-		t := pass.TypesInfo.TypeOf(field.Type)
-		isError := t != nil && t.String() == "error"
-		count := max(len(field.Names), 1)
-		if isError {
-			for i := range count {
-				indices = append(indices, idx+i)
-			}
-			for _, name := range field.Names {
-				namedVars = append(namedVars, name.Name)
-			}
-		}
-		idx += count
-	}
-	return indices, namedVars
-}
-
-func isWrapped(pass *analysis.Pass, expr ast.Expr) bool {
-	if ident, ok := expr.(*ast.Ident); ok && ident.Name == "nil" {
-		return true
-	}
-	call, ok := expr.(*ast.CallExpr)
-	if !ok {
-		return false
-	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	pkgName, ok := pass.TypesInfo.Uses[ident].(*types.PkgName)
-	return ok && pkgName.Imported().Path() == errUtilPkg
 }
