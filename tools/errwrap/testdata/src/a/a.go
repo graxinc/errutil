@@ -216,3 +216,11 @@ func namedReturnBareConditional(cond bool) (err error) {
 	}
 	return // want "bare return with named error return; error assigned at line 213 should be wrapped" "bare return with named error return; error assigned at line 215 should be wrapped"
 }
+
+func returnAfterVar() error {
+	var err error
+	if true {
+		err = errutil.New(errutil.Tags{"foo": "bar"})
+	}
+	return err // want "error should be wrapped with errutil.With or errutil.Wrap"
+}

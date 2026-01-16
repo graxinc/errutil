@@ -7,5 +7,5 @@ import (
 )
 
 func main() {
-	singlechecker.Main(errwrap.Analyzer)
+	singlechecker.Main(errwrap.Analyzer())
 }

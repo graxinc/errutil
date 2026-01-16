@@ -15,12 +15,13 @@ import (
 
 const errUtilPkg = "github.com/graxinc/errutil"
 
-// Analyzer is the errwrap analyzer.
-var Analyzer = &analysis.Analyzer{
-	Name:     "errwrap",
-	Doc:      "check that errors are wrapped with errutil.With or errutil.Wrap",
-	Requires: []*analysis.Analyzer{inspect.Analyzer},
-	Run:      run,
+func Analyzer() *analysis.Analyzer {
+	return &analysis.Analyzer{
+		Name:     "errwrap",
+		Doc:      "check that errors are wrapped with errutil.With or errutil.Wrap",
+		Requires: []*analysis.Analyzer{inspect.Analyzer},
+		Run:      run,
+	}
 }
 
 func run(pass *analysis.Pass) (any, error) {
@@ -139,11 +140,12 @@ func fileForPos(pass *analysis.Pass, pos token.Pos) *ast.File {
 // isFileNolint checks if the file has a nolint:errwrap directive before the package declaration.
 func isFileNolint(f *ast.File) bool {
 	for _, cg := range f.Comments {
-		if cg.Pos() < f.Package {
-			for _, c := range cg.List {
-				if strings.Contains(c.Text, "nolint:errwrap") {
-					return true
-				}
+		if cg.Pos() >= f.Package {
+			continue
+		}
+		for _, c := range cg.List {
+			if strings.Contains(c.Text, "nolint:errwrap") {
+				return true
 			}
 		}
 	}
