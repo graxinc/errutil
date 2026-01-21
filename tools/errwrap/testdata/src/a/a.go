@@ -97,7 +97,7 @@ func goodNamedNil() (err error) {
 }
 
 func goodNamedWrapped() (err error) {
-	err = errutil.With(errors.New("x"))
+	err = errutil.New(errutil.Tags{"k": "v"})
 	return
 }
 
@@ -151,8 +151,7 @@ func badPhiMixed(cond bool) error {
 }
 
 // Last assignment is wrapped.
-func goodReassignToWrapped() error {
-	err := errors.New("x")
+func goodReassignToWrapped(err error) error {
 	err = errutil.With(err)
 	return err
 }
@@ -213,4 +212,64 @@ func badMultiReturnDeferUnwrapped(fail bool) (*int, error) {
 		return nil, errors.New("x") // want `error should be wrapped`
 	}
 	return &x, nil
+}
+
+type errReturner struct{}
+
+func (e errReturner) getErr() error { return nil }
+
+func badDirectWrapCall(f func() error) error {
+	return errutil.With(f()) // want `do not directly wrap`
+}
+
+func badDirectWrapMethod() error {
+	r := errReturner{}
+	return errutil.With(r.getErr()) // want `do not directly wrap`
+}
+
+func badDirectWrapInlineFunc() error {
+	return errutil.Wrap(func() error { // want `do not directly wrap`
+		return nil
+	}())
+}
+
+func goodNilCheckNeq(f func() error) error {
+	if err := f(); err != nil {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+func goodNilCheckNeqReversed(f func() error) error {
+	if err := f(); nil != err {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+func goodNilCheckEqElse(f func() error) error {
+	if err := f(); err == nil {
+		return nil
+	} else {
+		return errutil.With(err)
+	}
+}
+
+// Nested if after nil check - wrap is in a grandchild block of the nil check.
+func goodNilCheckNested(f func() error, cond bool) error {
+	if err := f(); err != nil {
+		if cond {
+			return nil
+		}
+		return errutil.With(err)
+	}
+	return nil
+}
+
+func goodPhiCycle(cond func() bool) error {
+	var err error
+	for cond() {
+		err = err // SSA: phi [nil, phi] - self-referential
+	}
+	return err
 }

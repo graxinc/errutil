@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -103,50 +104,61 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
 				if idx >= len(ret.Results) {
 					continue
 				}
-				if !isWrapped(ret.Results[idx], make(map[ssa.Value]bool)) {
-					pass.Reportf(retPos, "error should be wrapped with errutil.With or errutil.Wrap")
+				if msg := checkWrapped(ret.Results[idx], make(map[ssa.Value]bool)); msg != "" {
+					pass.Report(analysis.Diagnostic{Pos: retPos, Message: msg})
 				}
 			}
 		}
 	}
 }
 
-// isWrapped returns true if the value is properly wrapped (nil or from errutil).
-func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
-	if v == nil || visited[v] {
-		return v == nil
+const (
+	msgUnwrapped  = "error should be wrapped with errutil.With or errutil.Wrap"
+	msgDirectCall = "do not directly wrap errors from function calls; check for nil"
+)
+
+// checkWrapped returns an error message if the value is not properly wrapped, or "" if valid.
+func checkWrapped(v ssa.Value, visited map[ssa.Value]bool) string {
+	if v == nil {
+		return ""
+	}
+	if visited[v] {
+		return "" // cycle - already being checked, assume OK
 	}
 	visited[v] = true
 
 	switch val := v.(type) {
 	case *ssa.Const:
-		return val.IsNil()
+		if val.IsNil() {
+			return ""
+		}
+		return msgUnwrapped
 
 	case *ssa.Call:
-		return isErrUtilCall(val)
+		return checkErrUtilCall(val)
 
 	case *ssa.Phi:
 		for _, edge := range val.Edges {
-			if !isWrapped(edge, visited) {
-				return false
+			if msg := checkWrapped(edge, visited); msg != "" {
+				return msg
 			}
 		}
-		return true
+		return ""
 
 	case *ssa.Extract:
 		switch tuple := val.Tuple.(type) {
 		case *ssa.Call:
-			return isErrUtilCall(tuple)
+			return checkErrUtilCall(tuple)
 		case *ssa.TypeAssert:
-			return isWrapped(tuple.X, visited)
+			return checkWrapped(tuple.X, visited)
 		}
-		return false
+		return msgUnwrapped
 
 	case *ssa.MakeInterface:
-		return isWrapped(val.X, visited)
+		return checkWrapped(val.X, visited)
 
 	case *ssa.ChangeInterface:
-		return isWrapped(val.X, visited)
+		return checkWrapped(val.X, visited)
 
 	case *ssa.UnOp:
 		// Dereference - check the underlying value.
@@ -158,33 +170,131 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 				for _, instr := range val.Block().Instrs {
 					store, ok := instr.(*ssa.Store)
 					if ok && store.Addr == alloc {
-						return isWrapped(store.Val, visited)
+						return checkWrapped(store.Val, visited)
 					}
 				}
 			}
-			return false
+			return msgUnwrapped
 		}
-		return isWrapped(val.X, visited)
+		return checkWrapped(val.X, visited)
 
 	case *ssa.TypeAssert:
-		return isWrapped(val.X, visited)
+		return checkWrapped(val.X, visited)
 
 	default:
-		return false
+		return msgUnwrapped
 	}
 }
 
-// isErrUtilCall checks if an SSA Call instruction is a call to an errutil function.
-func isErrUtilCall(call *ssa.Call) bool {
+// checkErrUtilCall returns an error message if the call is not a valid errutil call, or "" if valid.
+func checkErrUtilCall(call *ssa.Call) string {
 	callee := call.Call.StaticCallee()
 	if callee == nil {
-		return false
+		return msgUnwrapped
 	}
 	pkg := callee.Package()
 	if pkg == nil {
+		return msgUnwrapped
+	}
+	if pkg.Pkg.Path() != errUtilPkg {
+		return msgUnwrapped
+	}
+
+	// For With/Wrap/Witht/Wrapt, check that the error argument is not a direct function call.
+	// Wrapping a function call directly is dangerous because if the function returns nil,
+	// With(nil) creates a non-nil wrapped error. Even for errors.New/fmt.Errorf, users
+	// should use errutil.New directly instead.
+	// However, if the value has been nil-checked, it's safe to wrap.
+	name := callee.Name()
+	if name == "With" || name == "Wrap" || name == "Witht" || name == "Wrapt" {
+		if len(call.Call.Args) > 0 {
+			arg := call.Call.Args[0]
+			if isDirectCall(arg) && !isNilChecked(arg, call.Block()) {
+				return msgDirectCall
+			}
+		}
+	}
+
+	return ""
+}
+
+// isDirectCall returns true if the value is a direct function call or extracted from one.
+func isDirectCall(v ssa.Value) bool {
+	switch a := v.(type) {
+	case *ssa.Call:
+		return true
+	case *ssa.Extract:
+		_, ok := a.Tuple.(*ssa.Call)
+		return ok
+	}
+	return false
+}
+
+// isNilChecked returns true if the value has been checked for nil before reaching the given block.
+// This detects patterns like: if err := f(); err != nil { return errutil.With(err) }
+// It walks up the predecessor chain to handle nested ifs.
+func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
+	return isNilCheckedWalk(v, block, make(map[*ssa.BasicBlock]bool))
+}
+
+func isNilCheckedWalk(v ssa.Value, block *ssa.BasicBlock, visited map[*ssa.BasicBlock]bool) bool {
+	if block == nil || visited[block] {
 		return false
 	}
-	return pkg.Pkg.Path() == errUtilPkg
+	visited[block] = true
+
+	for _, pred := range block.Preds {
+		if len(pred.Instrs) == 0 {
+			continue
+		}
+
+		// Check if predecessor ends with an If on our value compared to nil
+		ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
+		if !ok {
+			continue
+		}
+		binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+		if !ok {
+			if isNilCheckedWalk(v, pred, visited) {
+				return true
+			}
+			continue
+		}
+
+		var checkedVal ssa.Value
+		if isNilConst(binOp.X) {
+			checkedVal = binOp.Y
+		} else if isNilConst(binOp.Y) {
+			checkedVal = binOp.X
+		}
+
+		if checkedVal != v {
+			if isNilCheckedWalk(v, pred, visited) {
+				return true
+			}
+			continue
+		}
+
+		// SSA If: Succs[0]=true branch, Succs[1]=false branch
+		// We're in the non-nil branch if: (!= nil and in true branch) or (== nil and in false branch)
+		switch binOp.Op {
+		case token.NEQ:
+			if pred.Succs[0] == block || slices.Contains(block.Preds, pred.Succs[0]) {
+				return true
+			}
+		case token.EQL:
+			if pred.Succs[1] == block || slices.Contains(block.Preds, pred.Succs[1]) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func isNilConst(v ssa.Value) bool {
+	c, ok := v.(*ssa.Const)
+	return ok && c.IsNil()
 }
 
 func isErrorType(t types.Type) bool {
