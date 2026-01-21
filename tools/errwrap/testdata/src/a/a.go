@@ -106,6 +106,30 @@ func badNamedBare() (err error) {
 	return // want `error should be wrapped`
 }
 
+func goodNamedBlankNil() (_ error) {
+	return nil
+}
+
+func goodNamedBlankWrapped() (_ error) {
+	return errutil.New(errutil.Tags{"k": "v"})
+}
+
+func badNamedBlankUnwrapped() (_ error) {
+	return errors.New("x") // want `error should be wrapped`
+}
+
+func goodMultiNamedBlankNil() (_ int, _ error) {
+	return 42, nil
+}
+
+func goodMultiNamedBlankWrapped() (_ int, _ error) {
+	return 42, errutil.New(errutil.Tags{"k": "v"})
+}
+
+func badMultiNamedBlankUnwrapped() (_ int, _ error) {
+	return 42, errors.New("x") // want `error should be wrapped`
+}
+
 // All phi edges wrapped.
 func goodPhiAllWrapped(cond bool) error {
 	var err error
