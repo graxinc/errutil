@@ -149,10 +149,20 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 		return isWrapped(val.X, visited)
 
 	case *ssa.UnOp:
-		// Check if this is a dereference of an Alloc (named return variable).
-		// If so, trace the values stored into the alloc.
+		// Dereference - check the underlying value.
+		// If it's an Alloc (used for returns when defer is present), find the store
+		// in the same basic block that writes to this alloc.
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
-			return isAllocWrapped(alloc, visited)
+			// Find the store to this alloc in the same block as the load
+			if val.Block() != nil {
+				for _, instr := range val.Block().Instrs {
+					store, ok := instr.(*ssa.Store)
+					if ok && store.Addr == alloc {
+						return isWrapped(store.Val, visited)
+					}
+				}
+			}
+			return false
 		}
 		return isWrapped(val.X, visited)
 
@@ -162,32 +172,6 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 	default:
 		return false
 	}
-}
-
-// isAllocWrapped checks if all values stored into an Alloc are wrapped.
-// This handles named return variables where the value is stored and then loaded.
-func isAllocWrapped(alloc *ssa.Alloc, visited map[ssa.Value]bool) bool {
-	// Find all stores to this alloc by checking its referrers
-	refs := alloc.Referrers()
-	if refs == nil {
-		return false
-	}
-
-	for _, ref := range *refs {
-		store, ok := ref.(*ssa.Store)
-		if !ok {
-			continue
-		}
-		// Check if this store is writing to our alloc
-		if store.Addr != alloc {
-			continue
-		}
-		// Check if the stored value is wrapped
-		if !isWrapped(store.Val, visited) {
-			return false
-		}
-	}
-	return true
 }
 
 // isErrUtilCall checks if an SSA Call instruction is a call to an errutil function.

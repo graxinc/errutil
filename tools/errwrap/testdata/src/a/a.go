@@ -185,3 +185,32 @@ func badIndexAccess(errs []error) error {
 func badMapLookup(m map[string]error) error {
 	return m["key"] // want `error should be wrapped`
 }
+
+func goodMultiReturn() (*int, error) {
+	x := 42
+	return &x, nil
+}
+
+func goodMultiReturnDefer() (*int, error) {
+	x := 42
+	defer func() {}()
+	return &x, nil
+}
+
+func goodMultiReturnDeferMultiple(fail bool) (*int, error) {
+	x := 42
+	defer func() {}()
+	if fail {
+		return nil, errutil.New(errutil.Tags{"k": "v"})
+	}
+	return &x, nil
+}
+
+func badMultiReturnDeferUnwrapped(fail bool) (*int, error) {
+	x := 42
+	defer func() {}()
+	if fail {
+		return nil, errors.New("x") // want `error should be wrapped`
+	}
+	return &x, nil
+}
