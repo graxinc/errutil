@@ -273,3 +273,19 @@ func goodPhiCycle(cond func() bool) error {
 	}
 	return err
 }
+
+func badWrapErrorsNew() error {
+	return errutil.With(errors.New("x")) // want `do not directly wrap`
+}
+
+func badWrapFmtErrorf() error {
+	return errutil.Wrap(fmt.Errorf("x")) // want `do not directly wrap`
+}
+
+func badWithtErrorsNew() error {
+	return errutil.Witht(errors.New("x"), errutil.Tags{"k": "v"}) // want `do not directly wrap`
+}
+
+func badWraptFmtErrorf() error {
+	return errutil.Wrapt(fmt.Errorf("x"), errutil.Tags{"k": "v"}) // want `do not directly wrap`
+}

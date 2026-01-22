@@ -114,7 +114,7 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
 
 const (
 	msgUnwrapped  = "error should be wrapped with errutil.With or errutil.Wrap"
-	msgDirectCall = "do not directly wrap errors from function calls; check for nil"
+	msgDirectCall = "do not directly wrap function calls; check for nil first"
 )
 
 // checkWrapped returns an error message if the value is not properly wrapped, or "" if valid.
@@ -201,16 +201,12 @@ func checkErrUtilCall(call *ssa.Call) string {
 	}
 
 	// For With/Wrap/Witht/Wrapt, check that the error argument is not a direct function call.
-	// Wrapping a function call directly is dangerous because if the function returns nil,
-	// With(nil) creates a non-nil wrapped error. Even for errors.New/fmt.Errorf, users
-	// should use errutil.New directly instead.
-	// However, if the value has been nil-checked, it's safe to wrap.
 	name := callee.Name()
 	if name == "With" || name == "Wrap" || name == "Witht" || name == "Wrapt" {
 		if len(call.Call.Args) > 0 {
 			arg := call.Call.Args[0]
-			if isDirectCall(arg) && !isNilChecked(arg, call.Block()) {
-				return msgDirectCall
+			if msg := checkDirectCallArg(arg, call.Block()); msg != "" {
+				return msg
 			}
 		}
 	}
@@ -218,26 +214,27 @@ func checkErrUtilCall(call *ssa.Call) string {
 	return ""
 }
 
-// isDirectCall returns true if the value is a direct function call or extracted from one.
-func isDirectCall(v ssa.Value) bool {
+// checkDirectCallArg checks if the argument is a direct function call and returns an error message if problematic.
+func checkDirectCallArg(v ssa.Value, block *ssa.BasicBlock) string {
+	isCall := false
 	switch a := v.(type) {
 	case *ssa.Call:
-		return true
+		isCall = true
 	case *ssa.Extract:
-		_, ok := a.Tuple.(*ssa.Call)
-		return ok
+		_, isCall = a.Tuple.(*ssa.Call)
 	}
-	return false
+	if !isCall {
+		return ""
+	}
+	if isNilChecked(v, block, make(map[*ssa.BasicBlock]bool)) {
+		return ""
+	}
+	return msgDirectCall
 }
 
 // isNilChecked returns true if the value has been checked for nil before reaching the given block.
 // This detects patterns like: if err := f(); err != nil { return errutil.With(err) }
-// It walks up the predecessor chain to handle nested ifs.
-func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
-	return isNilCheckedWalk(v, block, make(map[*ssa.BasicBlock]bool))
-}
-
-func isNilCheckedWalk(v ssa.Value, block *ssa.BasicBlock, visited map[*ssa.BasicBlock]bool) bool {
+func isNilChecked(v ssa.Value, block *ssa.BasicBlock, visited map[*ssa.BasicBlock]bool) bool {
 	if block == nil || visited[block] {
 		return false
 	}
@@ -255,7 +252,7 @@ func isNilCheckedWalk(v ssa.Value, block *ssa.BasicBlock, visited map[*ssa.Basic
 		}
 		binOp, ok := ifInstr.Cond.(*ssa.BinOp)
 		if !ok {
-			if isNilCheckedWalk(v, pred, visited) {
+			if isNilChecked(v, pred, visited) {
 				return true
 			}
 			continue
@@ -269,7 +266,7 @@ func isNilCheckedWalk(v ssa.Value, block *ssa.BasicBlock, visited map[*ssa.Basic
 		}
 
 		if checkedVal != v {
-			if isNilCheckedWalk(v, pred, visited) {
+			if isNilChecked(v, pred, visited) {
 				return true
 			}
 			continue
