@@ -16,6 +16,11 @@ import (
 
 const errUtilPkg = "github.com/graxinc/errutil"
 
+const (
+	msgUnwrapped  = "error should be wrapped with errutil.With or errutil.Wrap"
+	msgDirectCall = "do not directly wrap function calls; check for nil first"
+)
+
 func Analyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
 		Name:     "errwrap",
@@ -28,102 +33,82 @@ func Analyzer() *analysis.Analyzer {
 func run(pass *analysis.Pass) (any, error) {
 	ssaInfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 
-	// Collect all functions including anonymous ones, using a worklist algorithm
 	seen := make(map[*ssa.Function]bool)
-	worklist := append([]*ssa.Function{}, ssaInfo.SrcFuncs...)
-
-	// Include package-level function members (handles function literals in var initializers)
-	if ssaInfo.Pkg != nil {
-		for _, mem := range ssaInfo.Pkg.Members {
-			if fn, ok := mem.(*ssa.Function); ok {
-				worklist = append(worklist, fn)
-			}
-		}
-	}
-
-	for len(worklist) > 0 {
-		fn := worklist[len(worklist)-1]
-		worklist = worklist[:len(worklist)-1]
+	var check func(fn *ssa.Function)
+	check = func(fn *ssa.Function) {
 		if fn == nil || seen[fn] {
-			continue
+			return
 		}
 		seen[fn] = true
 		checkFunction(pass, fn)
-		worklist = append(worklist, fn.AnonFuncs...)
+		for _, anon := range fn.AnonFuncs {
+			check(anon)
+		}
 	}
 
+	for _, fn := range ssaInfo.SrcFuncs {
+		check(fn)
+	}
+	if ssaInfo.Pkg != nil {
+		for _, mem := range ssaInfo.Pkg.Members {
+			if fn, ok := mem.(*ssa.Function); ok {
+				check(fn)
+			}
+		}
+	}
 	return nil, nil
 }
 
 func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
-	// Check for file-level or function-level nolint
 	if fn.Syntax() == nil {
 		return
 	}
 	file := fileForPos(pass, fn.Pos())
-	if file == nil || isFileNolint(file) || isNolintNear(file, pass.Fset, fn.Pos()) {
+	if file == nil || hasNolint(file, pass.Fset, fn.Pos()) {
 		return
 	}
 
-	// Check if function returns error
-	sig := fn.Signature
-	results := sig.Results()
-	if results == nil {
+	errIdx := errorResultIndex(fn.Signature)
+	if errIdx < 0 {
 		return
 	}
 
-	// Find which result indices are errors
-	var errIndices []int
-	for i := range results.Len() {
-		if isErrorType(results.At(i).Type()) {
-			errIndices = append(errIndices, i)
-		}
-	}
-	if len(errIndices) == 0 {
-		return
-	}
-
-	// Analyze each basic block for return instructions
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			ret, ok := instr.(*ssa.Return)
-			if !ok {
+			if !ok || !ret.Pos().IsValid() {
 				continue
 			}
-
-			retPos := ret.Pos()
-			if !retPos.IsValid() {
+			if hasNolint(file, pass.Fset, ret.Pos()) {
 				continue
 			}
-			if isNolintNear(file, pass.Fset, retPos) {
-				continue
-			}
-
-			// Check each error return value
-			for _, idx := range errIndices {
-				if idx >= len(ret.Results) {
-					continue
-				}
-				if msg := checkWrapped(ret.Results[idx], make(map[ssa.Value]bool)); msg != "" {
-					pass.Report(analysis.Diagnostic{Pos: retPos, Message: msg})
+			if errIdx < len(ret.Results) {
+				if msg := checkValue(ret.Results[errIdx], make(map[ssa.Value]bool)); msg != "" {
+					pass.Report(analysis.Diagnostic{Pos: ret.Pos(), Message: msg})
 				}
 			}
 		}
 	}
 }
 
-const (
-	msgUnwrapped  = "error should be wrapped with errutil.With or errutil.Wrap"
-	msgDirectCall = "do not directly wrap function calls; check for nil first"
-)
-
-// checkWrapped returns an error message if the value is not properly wrapped, or "" if valid.
-func checkWrapped(v ssa.Value, visited map[ssa.Value]bool) string {
-	if v == nil {
-		return ""
+func errorResultIndex(sig *types.Signature) int {
+	results := sig.Results()
+	if results == nil {
+		return -1
 	}
-	if visited[v] {
-		return "" // cycle - already being checked, assume OK
+	errType := types.Universe.Lookup("error").Type()
+	for i := range results.Len() {
+		if types.Identical(results.At(i).Type(), errType) {
+			return i
+		}
+	}
+	return -1
+}
+
+// checkValue returns an error message if the value is not properly wrapped.
+func checkValue(v ssa.Value, visited map[ssa.Value]bool) string {
+	if v == nil || visited[v] {
+		return ""
 	}
 	visited[v] = true
 
@@ -132,186 +117,171 @@ func checkWrapped(v ssa.Value, visited map[ssa.Value]bool) string {
 		if val.IsNil() {
 			return ""
 		}
-		return msgUnwrapped
-
 	case *ssa.Call:
-		return checkErrUtilCall(val)
-
+		return checkCall(val)
 	case *ssa.Phi:
 		for _, edge := range val.Edges {
-			if msg := checkWrapped(edge, visited); msg != "" {
+			if msg := checkValue(edge, visited); msg != "" {
 				return msg
 			}
 		}
 		return ""
-
 	case *ssa.Extract:
-		switch tuple := val.Tuple.(type) {
-		case *ssa.Call:
-			return checkErrUtilCall(tuple)
-		case *ssa.TypeAssert:
-			return checkWrapped(tuple.X, visited)
+		if call, ok := val.Tuple.(*ssa.Call); ok {
+			return checkCall(call)
 		}
-		return msgUnwrapped
-
-	case *ssa.MakeInterface:
-		return checkWrapped(val.X, visited)
-
-	case *ssa.ChangeInterface:
-		return checkWrapped(val.X, visited)
-
+	case *ssa.MakeInterface, *ssa.ChangeInterface, *ssa.TypeAssert:
+		return checkValue(operand(val), visited)
 	case *ssa.UnOp:
-		// Dereference - check the underlying value.
-		// If it's an Alloc (used for returns when defer or range-over-func is present),
-		// find the store to this alloc. First check the same block (for defer where each
-		// return has its own store), then check all blocks (for range-over-func).
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
-			if val.Block() != nil {
-				for _, instr := range val.Block().Instrs {
-					if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
-						return checkWrapped(store.Val, visited)
-					}
-				}
-			}
-			fn := alloc.Parent()
-			if fn == nil {
-				return msgUnwrapped
-			}
-			for _, block := range fn.Blocks {
-				for _, instr := range block.Instrs {
-					if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
-						if msg := checkWrapped(store.Val, visited); msg != "" {
-							return msg
-						}
-					}
-				}
-			}
-			return ""
+			return checkAlloc(alloc, val.Block(), visited)
 		}
-		return checkWrapped(val.X, visited)
-
-	case *ssa.TypeAssert:
-		return checkWrapped(val.X, visited)
-
-	case *ssa.FreeVar:
-		// Free variables capture values from outer scope - can't trace origin
-		return msgUnwrapped
-
-	default:
-		return msgUnwrapped
+		return checkValue(val.X, visited)
 	}
+	return msgUnwrapped
 }
 
-// checkErrUtilCall returns an error message if the call is not a valid errutil call, or "" if valid.
-func checkErrUtilCall(call *ssa.Call) string {
-	callee := call.Call.StaticCallee()
-	if callee == nil {
-		return msgUnwrapped
+func operand(v ssa.Value) ssa.Value {
+	switch val := v.(type) {
+	case *ssa.MakeInterface:
+		return val.X
+	case *ssa.ChangeInterface:
+		return val.X
+	case *ssa.TypeAssert:
+		return val.X
 	}
-	pkg := callee.Package()
-	if pkg == nil {
-		return msgUnwrapped
-	}
-	if pkg.Pkg.Path() != errUtilPkg {
-		return msgUnwrapped
-	}
+	return nil
+}
 
-	// For With/Wrap/Witht/Wrapt, check that the error argument is not a direct function call.
-	name := callee.Name()
-	if name == "With" || name == "Wrap" || name == "Witht" || name == "Wrapt" {
-		if len(call.Call.Args) > 0 {
-			arg := call.Call.Args[0]
-			if msg := checkDirectCallArg(arg, call.Block()); msg != "" {
+func checkAlloc(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) string {
+	if alloc.Referrers() == nil {
+		return msgUnwrapped
+	}
+	// First check for a store in the same block as the load (handles defer)
+	if loadBlock != nil {
+		for _, ref := range *alloc.Referrers() {
+			if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc && store.Block() == loadBlock {
+				return checkValue(store.Val, visited)
+			}
+		}
+	}
+	// Then check all stores (handles range-over-func)
+	for _, ref := range *alloc.Referrers() {
+		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
+			if msg := checkValue(store.Val, visited); msg != "" {
 				return msg
 			}
 		}
 	}
-
 	return ""
 }
 
-// checkDirectCallArg checks if the argument is a direct function call and returns an error message if problematic.
-func checkDirectCallArg(v ssa.Value, block *ssa.BasicBlock) string {
-	isCall := false
+func checkCall(call *ssa.Call) string {
+	callee := call.Call.StaticCallee()
+	if callee == nil || callee.Package() == nil {
+		return msgUnwrapped
+	}
+	if callee.Package().Pkg.Path() != errUtilPkg {
+		return msgUnwrapped
+	}
+
+	name := callee.Name()
+	if name == "With" || name == "Wrap" || name == "Witht" || name == "Wrapt" {
+		if len(call.Call.Args) > 0 {
+			if msg := checkDirectCall(call.Call.Args[0], call.Block()); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+func checkDirectCall(v ssa.Value, block *ssa.BasicBlock) string {
+	var call *ssa.Call
 	switch a := v.(type) {
 	case *ssa.Call:
-		isCall = true
+		call = a
 	case *ssa.Extract:
-		_, isCall = a.Tuple.(*ssa.Call)
-	}
-	if !isCall {
+		c, ok := a.Tuple.(*ssa.Call)
+		if !ok {
+			return ""
+		}
+		call = c
+	default:
 		return ""
 	}
-	if isNilChecked(v, block, make(map[*ssa.BasicBlock]bool)) {
+	_ = call // the value is a call
+
+	if isNilChecked(v, block) {
 		return ""
 	}
 	return msgDirectCall
 }
 
-// isNilChecked returns true if the value has been checked for nil before reaching the given block.
-// This detects patterns like: if err := f(); err != nil { return errutil.With(err) }
-func isNilChecked(v ssa.Value, block *ssa.BasicBlock, visited map[*ssa.BasicBlock]bool) bool {
-	if block == nil || visited[block] {
+func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
+	visited := make(map[*ssa.BasicBlock]bool)
+	var walk func(*ssa.BasicBlock) bool
+	walk = func(b *ssa.BasicBlock) bool {
+		if b == nil || visited[b] {
+			return false
+		}
+		visited[b] = true
+
+		for _, pred := range b.Preds {
+			if len(pred.Instrs) == 0 {
+				continue
+			}
+			ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
+			if !ok {
+				if walk(pred) {
+					return true
+				}
+				continue
+			}
+			binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+			if !ok {
+				if walk(pred) {
+					return true
+				}
+				continue
+			}
+
+			// Check if comparing our value to nil
+			var checkedVal ssa.Value
+			if isNilConst(binOp.X) {
+				checkedVal = binOp.Y
+			} else if isNilConst(binOp.Y) {
+				checkedVal = binOp.X
+			}
+			if checkedVal != v {
+				if walk(pred) {
+					return true
+				}
+				continue
+			}
+
+			// Check we're in the non-nil branch
+			trueBlock, falseBlock := pred.Succs[0], pred.Succs[1]
+			switch binOp.Op {
+			case token.NEQ: // err != nil, true branch is non-nil
+				if trueBlock == b || slices.Contains(b.Preds, trueBlock) {
+					return true
+				}
+			case token.EQL: // err == nil, false branch is non-nil
+				if falseBlock == b || slices.Contains(b.Preds, falseBlock) {
+					return true
+				}
+			}
+		}
 		return false
 	}
-	visited[block] = true
-
-	for _, pred := range block.Preds {
-		if len(pred.Instrs) == 0 {
-			continue
-		}
-
-		// Check if predecessor ends with an If on our value compared to nil
-		ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
-		if !ok {
-			continue
-		}
-		binOp, ok := ifInstr.Cond.(*ssa.BinOp)
-		if !ok {
-			if isNilChecked(v, pred, visited) {
-				return true
-			}
-			continue
-		}
-
-		var checkedVal ssa.Value
-		if isNilConst(binOp.X) {
-			checkedVal = binOp.Y
-		} else if isNilConst(binOp.Y) {
-			checkedVal = binOp.X
-		}
-
-		if checkedVal != v {
-			if isNilChecked(v, pred, visited) {
-				return true
-			}
-			continue
-		}
-
-		// SSA If: Succs[0]=true branch, Succs[1]=false branch
-		// We're in the non-nil branch if: (!= nil and in true branch) or (== nil and in false branch)
-		switch binOp.Op {
-		case token.NEQ:
-			if pred.Succs[0] == block || slices.Contains(block.Preds, pred.Succs[0]) {
-				return true
-			}
-		case token.EQL:
-			if pred.Succs[1] == block || slices.Contains(block.Preds, pred.Succs[1]) {
-				return true
-			}
-		}
-	}
-
-	return false
+	return walk(block)
 }
+
 
 func isNilConst(v ssa.Value) bool {
 	c, ok := v.(*ssa.Const)
 	return ok && c.IsNil()
-}
-
-func isErrorType(t types.Type) bool {
-	return types.Identical(t, types.Universe.Lookup("error").Type())
 }
 
 func fileForPos(pass *analysis.Pass, pos token.Pos) *ast.File {
@@ -323,24 +293,19 @@ func fileForPos(pass *analysis.Pass, pos token.Pos) *ast.File {
 	return nil
 }
 
-// isFileNolint checks if the file has a nolint:errwrap directive before the package declaration.
-func isFileNolint(f *ast.File) bool {
-	for _, cg := range f.Comments {
-		if cg.Pos() >= f.Package {
-			continue
-		}
-		for _, c := range cg.List {
-			if strings.Contains(c.Text, "nolint:errwrap") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isNolintNear(f *ast.File, fset *token.FileSet, pos token.Pos) bool {
+func hasNolint(f *ast.File, fset *token.FileSet, pos token.Pos) bool {
 	line := fset.Position(pos).Line
 	for _, cg := range f.Comments {
+		// File-level nolint (before package)
+		if cg.Pos() < f.Package {
+			for _, c := range cg.List {
+				if strings.Contains(c.Text, "nolint:errwrap") {
+					return true
+				}
+			}
+			continue
+		}
+		// Line-level nolint
 		for _, c := range cg.List {
 			cline := fset.Position(c.Pos()).Line
 			if (cline == line || cline == line-1) && strings.Contains(c.Text, "nolint:errwrap") {
