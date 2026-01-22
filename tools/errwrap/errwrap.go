@@ -162,24 +162,40 @@ func checkWrapped(v ssa.Value, visited map[ssa.Value]bool) string {
 
 	case *ssa.UnOp:
 		// Dereference - check the underlying value.
-		// If it's an Alloc (used for returns when defer is present), find the store
-		// in the same basic block that writes to this alloc.
+		// If it's an Alloc (used for returns when defer or range-over-func is present),
+		// find the store to this alloc. First check the same block (for defer where each
+		// return has its own store), then check all blocks (for range-over-func).
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
-			// Find the store to this alloc in the same block as the load
 			if val.Block() != nil {
 				for _, instr := range val.Block().Instrs {
-					store, ok := instr.(*ssa.Store)
-					if ok && store.Addr == alloc {
+					if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
 						return checkWrapped(store.Val, visited)
 					}
 				}
 			}
-			return msgUnwrapped
+			fn := alloc.Parent()
+			if fn == nil {
+				return msgUnwrapped
+			}
+			for _, block := range fn.Blocks {
+				for _, instr := range block.Instrs {
+					if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
+						if msg := checkWrapped(store.Val, visited); msg != "" {
+							return msg
+						}
+					}
+				}
+			}
+			return ""
 		}
 		return checkWrapped(val.X, visited)
 
 	case *ssa.TypeAssert:
 		return checkWrapped(val.X, visited)
+
+	case *ssa.FreeVar:
+		// Free variables capture values from outer scope - can't trace origin
+		return msgUnwrapped
 
 	default:
 		return msgUnwrapped
