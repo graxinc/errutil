@@ -1,4 +1,4 @@
-module github.com/graxinc/errutil/tools/errwrap
+module github.com/graxinc/errutil/tools
 
 go 1.25
 

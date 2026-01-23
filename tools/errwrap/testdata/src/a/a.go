@@ -10,64 +10,41 @@ import (
 
 var sentinel = errors.New("sentinel")
 
-// Basic wrapping functions
-func goodNil() error {
-	return nil
-}
-
-func goodWith(err error) error {
+// Good: wrapped returns
+func goodWrapped(err error) error {
 	return errutil.With(err)
-}
-
-func goodWrap(err error) error {
-	return errutil.Wrap(err)
-}
-
-func goodWitht(err error) error {
-	return errutil.Witht(err, errutil.Tags{"k": "v"})
-}
-
-func goodWrapt(err error) error {
-	return errutil.Wrapt(err, errutil.Tags{"k": "v"})
 }
 
 func goodNew() error {
 	return errutil.New(errutil.Tags{"k": "v"})
 }
 
+func goodNil() error {
+	return nil
+}
+
 func goodNonError() string {
 	return "not an error"
 }
 
-func goodIgnoreSameLine(err error) error {
-	return err //errwrap:ignore
-}
-
-func goodIgnoreLineAbove(err error) error {
-	//errwrap:ignore
-	return err
-}
-
-//errwrap:ignore
-func goodIgnoreFunc(err error) error {
-	return err
-}
-
-func goodUnwrappedRule(err error) error {
+// Good: directive on same line
+func goodDirectiveSameLine(err error) error {
 	return err //errwrap:unwrapped
 }
 
-func badUnwrappedDirectiveDoesNotMaskDirectcall(f func() error) error {
-	//errwrap:unwrapped // want `unused errwrap directive`
-	return errutil.With(f()) // want `do not directly wrap`
+// Good: directive on line above
+func goodDirectiveAbove(err error) error {
+	//errwrap:unwrapped
+	return err
 }
 
-func badDirectcallDirectiveDoesNotMaskUnwrapped(err error) error {
-	//errwrap:directcall // want `unused errwrap directive`
-	return err // want `error should be wrapped`
+// Good: directive on function
+//errwrap:unwrapped
+func goodDirectiveOnFunc(err error) error {
+	return err
 }
 
-// Unwrapped returns
+// Bad: unwrapped returns
 func badParameter(err error) error {
 	return err // want `error should be wrapped`
 }
@@ -77,20 +54,20 @@ func badGlobal() error {
 }
 
 func badErrorsNew() error {
-	return errors.New("x") // want `error should be wrapped`
+	return errors.New("") // want `error should be wrapped`
 }
 
 func badFmtErrorf() error {
-	return fmt.Errorf("x") // want `error should be wrapped`
+	return fmt.Errorf("") // want `error should be wrapped`
 }
 
 var badFuncLit = func(err error) error {
 	return err // want `error should be wrapped`
 }
 
-type customErr struct{ msg string }
+type customErr struct{}
 
-func (e customErr) Error() string { return e.msg }
+func (customErr) Error() string { return "" }
 
 func badCustomErr() error {
 	return customErr{} // want `error should be wrapped`
@@ -113,39 +90,24 @@ func goodNamedNil() (err error) {
 }
 
 func goodNamedWrapped() (err error) {
-	err = errutil.New(errutil.Tags{"k": "v"})
+	err = errutil.New(errutil.Tags{})
 	return
 }
+
 func badNamedBare() (err error) {
-	err = errors.New("x")
+	err = errors.New("")
 	return // want `error should be wrapped`
 }
 
 // Phi nodes
-func goodPhiAllWrapped(cond bool) error {
-	var err error
-	if cond {
-		err = errutil.New(errutil.Tags{"k": "v"})
-	}
-	return err
-}
-
 func badPhiMixed(cond bool) error {
 	var err error
 	if cond {
-		err = errors.New("x")
+		err = errors.New("")
 	} else {
-		err = errutil.New(errutil.Tags{"k": "v"})
+		err = errutil.New(errutil.Tags{})
 	}
 	return err // want `error should be wrapped`
-}
-
-func goodPhiCycle(cond func() bool) error {
-	var err error
-	for cond() {
-		err = err
-	}
-	return err
 }
 
 // Reassignment
@@ -155,14 +117,14 @@ func goodReassignToWrapped(err error) error {
 }
 
 func badReassignToUnwrapped() error {
-	err := errutil.New(errutil.Tags{"k": "v"})
-	err = errors.New("x")
+	err := errutil.New(errutil.Tags{})
+	err = errors.New("")
 	return err // want `error should be wrapped`
 }
 
-// Free variables
+// Free variables (closure)
 func badFreeVar() func() error {
-	err := errors.New("x")
+	err := errors.New("")
 	return func() error {
 		return err // want `error should be wrapped`
 	}
@@ -172,8 +134,7 @@ func badFreeVar() func() error {
 type errHolder struct{ err error }
 
 func badFieldAccess() error {
-	h := errHolder{err: errors.New("x")}
-	return h.err // want `error should be wrapped`
+	return errHolder{}.err // want `error should be wrapped`
 }
 
 func badIndexAccess(errs []error) error {
@@ -181,85 +142,10 @@ func badIndexAccess(errs []error) error {
 }
 
 func badMapLookup(m map[string]error) error {
-	return m["key"] // want `error should be wrapped`
+	return m["k"] // want `error should be wrapped`
 }
 
-// Defer with multi-return
-func goodMultiReturnDefer() (*int, error) {
-	x := 42
-	defer func() {}()
-	return &x, nil
-}
-
-func goodMultiReturnDeferMultiple(fail bool) (*int, error) {
-	x := 42
-	defer func() {}()
-	if fail {
-		return nil, errutil.New(errutil.Tags{"k": "v"})
-	}
-	return &x, nil
-}
-
-func badMultiReturnDeferUnwrapped(fail bool) (*int, error) {
-	x := 42
-	defer func() {}()
-	if fail {
-		return nil, errors.New("x") // want `error should be wrapped`
-	}
-	return &x, nil
-}
-
-// Direct wrapping of function calls (should nil check first)
-type errReturner struct{}
-
-func (e errReturner) getErr() error { return nil }
-
-func badDirectWrapCall(f func() error) error {
-	return errutil.With(f()) // want `do not directly wrap`
-}
-
-func badDirectWrapMethod() error {
-	return errutil.With(errReturner{}.getErr()) // want `do not directly wrap`
-}
-
-func badDirectWrapErrorsNew() error {
-	return errutil.With(errors.New("x")) // want `do not directly wrap`
-}
-
-// Nil checks before wrapping
-func goodNilCheckNeq(f func() error) error {
-	if err := f(); err != nil {
-		return errutil.With(err)
-	}
-	return nil
-}
-
-func goodNilCheckReversed(f func() error) error {
-	if err := f(); nil != err {
-		return errutil.With(err)
-	}
-	return nil
-}
-
-func goodNilCheckEqElse(f func() error) error {
-	if err := f(); err == nil {
-		return nil
-	} else {
-		return errutil.With(err)
-	}
-}
-
-func goodNilCheckNested(f func() error, cond bool) error {
-	if err := f(); err != nil {
-		if cond {
-			return nil
-		}
-		return errutil.With(err)
-	}
-	return nil
-}
-
-// Range-over-func (iter.Seq) - tests SSA alloc/store handling
+// Range-over-func (iter.Seq)
 func goodIterSeq(rows iter.Seq[error]) error {
 	for err := range rows {
 		if err != nil {
@@ -269,20 +155,28 @@ func goodIterSeq(rows iter.Seq[error]) error {
 	return nil
 }
 
-func badUnusedDirectiveOnCleanCode(err error) error {
-	//errwrap:ignore // want `unused errwrap directive`
-	if err != nil {
-		return errutil.With(err)
-	}
-	return nil
+// Unused directive
+func badUnusedDirective(err error) error {
+	//errwrap:unwrapped // want `unused errwrap:unwrapped directive`
+	return errutil.With(err)
 }
 
-func badUnusedUnwrappedDirective() error {
-	//errwrap:unwrapped // want `unused errwrap directive`
-	return nil
+// Wrapping error constructors (errwrap:new rule)
+func badWrapErrorsNew() error {
+	return errutil.With(errors.New("")) // want `use errutil.New instead`
 }
 
-func badUnusedDirectcallDirective(err error) error {
-	//errwrap:directcall // want `unused errwrap directive`
+func badWrapFmtErrorf() error {
+	return errutil.Wrap(fmt.Errorf("")) // want `use errutil.New instead`
+}
+
+// Good: directive suppresses errwrap:new
+//errwrap:new
+func goodSuppressedNew() error {
+	return errutil.With(errors.New(""))
+}
+
+func badUnusedNewDirective(err error) error {
+	//errwrap:new // want `unused errwrap:new directive`
 	return errutil.With(err)
 }

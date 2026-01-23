@@ -1,11 +1,8 @@
-//errwrap:ignore // want `unused errwrap directive`
+//errwrap:unwrapped // want `unused errwrap:unwrapped directive`
 package a
 
 import "github.com/graxinc/errutil"
 
 func cleanCodeInFileLevelIgnore(err error) error {
-	if err != nil {
-		return errutil.With(err)
-	}
-	return nil
+	return errutil.With(err)
 }

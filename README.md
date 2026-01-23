@@ -114,6 +114,56 @@ if err := topOfCalls(); err != nil {
 }
 ```
 
+## Tools
+
+The `tools/` directory contains static analyzers to enforce correct errutil usage patterns.
+
+### errwrap
+
+Ensures all returned errors are wrapped with `errutil.With`, `errutil.Wrap`, or variants.
+
+Rules:
+
+* **unwrapped** — returning errors without wrapping (`return err`, `return errors.New("x")`, etc.)
+* **new** — wrapping `errors.New` or `fmt.Errorf` instead of using `errutil.New`
+
+Suppress with `//errwrap:unwrapped` or `//errwrap:new` on the line, above it, on the function, or before the `package` declaration (file-wide).
+
+### errdirectcall
+
+Ensures `errutil.With`/`Wrap` is not called directly on a function call result without a nil check.
+
+Catches:
+
+* `return errutil.With(f())` — wraps nil errors unnecessarily, potentially leading to correctness issues
+
+Correct pattern:
+
+```go
+if err := f(); err != nil {
+    return errutil.With(err)
+}
+return nil
+```
+
+Suppress with `//errdirectcall:unchecked` on the call line, above it, on the function, or before the `package` declaration (file-wide).
+
+### Install
+
+```bash
+go install github.com/graxinc/errutil/tools/errwrap/cmd/errwrap@latest
+go install github.com/graxinc/errutil/tools/errdirectcall/cmd/errdirectcall@latest
+```
+
+### Run
+
+```bash
+errwrap ./...
+errdirectcall ./...
+```
+
+Both tools flag unneccessary directives as failures.
+
 ## Future improvements
 
 * Garbage reduction. Currently we maintain pointer equality in the same vein as `errors.New` as developers likely expect, however it requires heap allocation. This only shows up however in very fast loops.
