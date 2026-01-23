@@ -39,18 +39,22 @@ func goodNonError() string {
 	return "not an error"
 }
 
-func goodNolintSameLine(err error) error {
-	return err //nolint:errwrap
+func goodIgnoreSameLine(err error) error {
+	return err //errwrap:ignore
 }
 
-func goodNolintLineAbove(err error) error {
-	//nolint:errwrap
+func goodIgnoreLineAbove(err error) error {
+	//errwrap:ignore
 	return err
 }
 
-//nolint:errwrap
-func goodNolintFunc(err error) error {
+//errwrap:ignore
+func goodIgnoreFunc(err error) error {
 	return err
+}
+
+func goodUnwrappedRule(err error) error {
+	return err //errwrap:unwrapped
 }
 
 // Unwrapped returns

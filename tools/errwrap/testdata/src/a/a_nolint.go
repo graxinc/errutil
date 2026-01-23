@@ -1,7 +1,7 @@
-//nolint:errwrap
+//errwrap:ignore
 package a
 
-// Good: file-level nolint suppresses all errors.
+// Good: file-level ignore suppresses all errors.
 func returnUnwrappedInNolintFile(err error) error {
 	return err
 }

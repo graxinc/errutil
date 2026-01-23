@@ -17,9 +17,14 @@ import (
 const errUtilPkg = "github.com/graxinc/errutil"
 
 const (
-	msgUnwrapped  = "error should be wrapped with errutil.With or errutil.Wrap"
-	msgDirectCall = "do not directly wrap function calls; check for nil first"
+	ruleUnwrapped  = "unwrapped"
+	ruleDirectCall = "directcall"
 )
+
+var ruleMessages = map[string]string{
+	ruleUnwrapped:  "error should be wrapped with errutil.With or errutil.Wrap",
+	ruleDirectCall: "do not directly wrap function calls; check for nil first",
+}
 
 func Analyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
@@ -32,9 +37,8 @@ func Analyzer() *analysis.Analyzer {
 
 func run(pass *analysis.Pass) (any, error) {
 	ssaInfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-
 	seen := make(map[*ssa.Function]bool)
-	var check func(fn *ssa.Function)
+	var check func(*ssa.Function)
 	check = func(fn *ssa.Function) {
 		if fn == nil || seen[fn] {
 			return
@@ -45,7 +49,6 @@ func run(pass *analysis.Pass) (any, error) {
 			check(anon)
 		}
 	}
-
 	for _, fn := range ssaInfo.SrcFuncs {
 		check(fn)
 	}
@@ -64,27 +67,22 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
 		return
 	}
 	file := fileForPos(pass, fn.Pos())
-	if file == nil || hasNolint(file, pass.Fset, fn.Pos()) {
+	if file == nil {
 		return
 	}
-
 	errIdx := errorResultIndex(fn.Signature)
 	if errIdx < 0 {
 		return
 	}
-
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			ret, ok := instr.(*ssa.Return)
-			if !ok || !ret.Pos().IsValid() {
+			if !ok || !ret.Pos().IsValid() || errIdx >= len(ret.Results) {
 				continue
 			}
-			if hasNolint(file, pass.Fset, ret.Pos()) {
-				continue
-			}
-			if errIdx < len(ret.Results) {
-				if msg := checkValue(ret.Results[errIdx], make(map[ssa.Value]bool)); msg != "" {
-					pass.Report(analysis.Diagnostic{Pos: ret.Pos(), Message: msg})
+			if rule := checkValue(ret.Results[errIdx], make(map[ssa.Value]bool)); rule != "" {
+				if !isSuppressed(file, pass.Fset, fn.Pos(), ret.Pos(), rule) {
+					pass.Report(analysis.Diagnostic{Pos: ret.Pos(), Message: ruleMessages[rule]})
 				}
 			}
 		}
@@ -105,7 +103,6 @@ func errorResultIndex(sig *types.Signature) int {
 	return -1
 }
 
-// checkValue returns an error message if the value is not properly wrapped.
 func checkValue(v ssa.Value, visited map[ssa.Value]bool) string {
 	if v == nil || visited[v] {
 		return ""
@@ -121,8 +118,8 @@ func checkValue(v ssa.Value, visited map[ssa.Value]bool) string {
 		return checkCall(val)
 	case *ssa.Phi:
 		for _, edge := range val.Edges {
-			if msg := checkValue(edge, visited); msg != "" {
-				return msg
+			if rule := checkValue(edge, visited); rule != "" {
+				return rule
 			}
 		}
 		return ""
@@ -130,34 +127,25 @@ func checkValue(v ssa.Value, visited map[ssa.Value]bool) string {
 		if call, ok := val.Tuple.(*ssa.Call); ok {
 			return checkCall(call)
 		}
-	case *ssa.MakeInterface, *ssa.ChangeInterface, *ssa.TypeAssert:
-		return checkValue(operand(val), visited)
+	case *ssa.MakeInterface:
+		return checkValue(val.X, visited)
+	case *ssa.ChangeInterface:
+		return checkValue(val.X, visited)
+	case *ssa.TypeAssert:
+		return checkValue(val.X, visited)
 	case *ssa.UnOp:
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
 			return checkAlloc(alloc, val.Block(), visited)
 		}
 		return checkValue(val.X, visited)
 	}
-	return msgUnwrapped
-}
-
-func operand(v ssa.Value) ssa.Value {
-	switch val := v.(type) {
-	case *ssa.MakeInterface:
-		return val.X
-	case *ssa.ChangeInterface:
-		return val.X
-	case *ssa.TypeAssert:
-		return val.X
-	}
-	return nil
+	return ruleUnwrapped
 }
 
 func checkAlloc(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) string {
 	if alloc.Referrers() == nil {
-		return msgUnwrapped
+		return ruleUnwrapped
 	}
-	// First check for a store in the same block as the load (handles defer)
 	if loadBlock != nil {
 		for _, ref := range *alloc.Referrers() {
 			if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc && store.Block() == loadBlock {
@@ -165,11 +153,10 @@ func checkAlloc(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Val
 			}
 		}
 	}
-	// Then check all stores (handles range-over-func)
 	for _, ref := range *alloc.Referrers() {
 		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
-			if msg := checkValue(store.Val, visited); msg != "" {
-				return msg
+			if rule := checkValue(store.Val, visited); rule != "" {
+				return rule
 			}
 		}
 	}
@@ -178,44 +165,32 @@ func checkAlloc(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Val
 
 func checkCall(call *ssa.Call) string {
 	callee := call.Call.StaticCallee()
-	if callee == nil || callee.Package() == nil {
-		return msgUnwrapped
+	if callee == nil || callee.Package() == nil || callee.Package().Pkg.Path() != errUtilPkg {
+		return ruleUnwrapped
 	}
-	if callee.Package().Pkg.Path() != errUtilPkg {
-		return msgUnwrapped
-	}
-
-	name := callee.Name()
-	if name == "With" || name == "Wrap" || name == "Witht" || name == "Wrapt" {
+	switch callee.Name() {
+	case "With", "Wrap", "Witht", "Wrapt":
 		if len(call.Call.Args) > 0 {
-			if msg := checkDirectCall(call.Call.Args[0], call.Block()); msg != "" {
-				return msg
-			}
+			return checkDirectCall(call.Call.Args[0], call.Block())
 		}
 	}
 	return ""
 }
 
 func checkDirectCall(v ssa.Value, block *ssa.BasicBlock) string {
-	var call *ssa.Call
 	switch a := v.(type) {
 	case *ssa.Call:
-		call = a
 	case *ssa.Extract:
-		c, ok := a.Tuple.(*ssa.Call)
-		if !ok {
+		if _, ok := a.Tuple.(*ssa.Call); !ok {
 			return ""
 		}
-		call = c
 	default:
 		return ""
 	}
-	_ = call // the value is a call
-
 	if isNilChecked(v, block) {
 		return ""
 	}
-	return msgDirectCall
+	return ruleDirectCall
 }
 
 func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
@@ -226,7 +201,6 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 			return false
 		}
 		visited[b] = true
-
 		for _, pred := range b.Preds {
 			if len(pred.Instrs) == 0 {
 				continue
@@ -245,8 +219,6 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 				}
 				continue
 			}
-
-			// Check if comparing our value to nil
 			var checkedVal ssa.Value
 			if isNilConst(binOp.X) {
 				checkedVal = binOp.Y
@@ -259,15 +231,13 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 				}
 				continue
 			}
-
-			// Check we're in the non-nil branch
 			trueBlock, falseBlock := pred.Succs[0], pred.Succs[1]
 			switch binOp.Op {
-			case token.NEQ: // err != nil, true branch is non-nil
+			case token.NEQ:
 				if trueBlock == b || slices.Contains(b.Preds, trueBlock) {
 					return true
 				}
-			case token.EQL: // err == nil, false branch is non-nil
+			case token.EQL:
 				if falseBlock == b || slices.Contains(b.Preds, falseBlock) {
 					return true
 				}
@@ -277,7 +247,6 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 	}
 	return walk(block)
 }
-
 
 func isNilConst(v ssa.Value) bool {
 	c, ok := v.(*ssa.Const)
@@ -293,25 +262,28 @@ func fileForPos(pass *analysis.Pass, pos token.Pos) *ast.File {
 	return nil
 }
 
-func hasNolint(f *ast.File, fset *token.FileSet, pos token.Pos) bool {
-	line := fset.Position(pos).Line
+func isSuppressed(f *ast.File, fset *token.FileSet, fnPos, retPos token.Pos, rule string) bool {
+	fnLine := fset.Position(fnPos).Line
+	retLine := fset.Position(retPos).Line
 	for _, cg := range f.Comments {
-		// File-level nolint (before package)
 		if cg.Pos() < f.Package {
 			for _, c := range cg.List {
-				if strings.Contains(c.Text, "nolint:errwrap") {
+				if matchesDirective(c.Text, rule) {
 					return true
 				}
 			}
 			continue
 		}
-		// Line-level nolint
 		for _, c := range cg.List {
 			cline := fset.Position(c.Pos()).Line
-			if (cline == line || cline == line-1) && strings.Contains(c.Text, "nolint:errwrap") {
+			if (cline == fnLine || cline == fnLine-1 || cline == retLine || cline == retLine-1) && matchesDirective(c.Text, rule) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func matchesDirective(comment, rule string) bool {
+	return strings.Contains(comment, "errwrap:ignore") || strings.Contains(comment, "errwrap:"+rule)
 }
