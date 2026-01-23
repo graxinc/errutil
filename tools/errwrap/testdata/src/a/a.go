@@ -58,12 +58,12 @@ func goodUnwrappedRule(err error) error {
 }
 
 func badUnwrappedDirectiveDoesNotMaskDirectcall(f func() error) error {
-	//errwrap:unwrapped
+	//errwrap:unwrapped // want `unused errwrap directive`
 	return errutil.With(f()) // want `do not directly wrap`
 }
 
 func badDirectcallDirectiveDoesNotMaskUnwrapped(err error) error {
-	//errwrap:directcall
+	//errwrap:directcall // want `unused errwrap directive`
 	return err // want `error should be wrapped`
 }
 
@@ -267,4 +267,22 @@ func goodIterSeq(rows iter.Seq[error]) error {
 		}
 	}
 	return nil
+}
+
+func badUnusedDirectiveOnCleanCode(err error) error {
+	//errwrap:ignore // want `unused errwrap directive`
+	if err != nil {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+func badUnusedUnwrappedDirective() error {
+	//errwrap:unwrapped // want `unused errwrap directive`
+	return nil
+}
+
+func badUnusedDirectcallDirective(err error) error {
+	//errwrap:directcall // want `unused errwrap directive`
+	return errutil.With(err)
 }

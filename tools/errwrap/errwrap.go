@@ -3,7 +3,6 @@
 package errwrap
 
 import (
-	"go/ast"
 	"go/token"
 	"go/types"
 	"slices"
@@ -19,11 +18,13 @@ const errUtilPkg = "github.com/graxinc/errutil"
 const (
 	ruleUnwrapped  = "unwrapped"
 	ruleDirectCall = "directcall"
+	ruleUnused     = "unused"
 )
 
 var ruleMessages = map[string]string{
 	ruleUnwrapped:  "error should be wrapped with errutil.With or errutil.Wrap",
 	ruleDirectCall: "do not directly wrap function calls; check for nil first",
+	ruleUnused:     "unused errwrap directive",
 }
 
 func Analyzer() *analysis.Analyzer {
@@ -37,6 +38,8 @@ func Analyzer() *analysis.Analyzer {
 
 func run(pass *analysis.Pass) (any, error) {
 	ssaInfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	directives := collectDirectives(pass)
+
 	seen := make(map[*ssa.Function]bool)
 	var check func(*ssa.Function)
 	check = func(fn *ssa.Function) {
@@ -44,7 +47,7 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 		seen[fn] = true
-		checkFunction(pass, fn)
+		checkFunction(pass, fn, directives)
 		for _, anon := range fn.AnonFuncs {
 			check(anon)
 		}
@@ -59,21 +62,77 @@ func run(pass *analysis.Pass) (any, error) {
 			}
 		}
 	}
+
+	for _, d := range directives {
+		if !d.used {
+			pass.Report(analysis.Diagnostic{Pos: d.pos, Message: ruleMessages[ruleUnused]})
+		}
+	}
 	return nil, nil
 }
 
-func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
-	if fn.Syntax() == nil {
-		return
+type directive struct {
+	pos  token.Pos
+	file token.Pos
+	line int // -1 for filewide
+	rules []string
+	used  bool
+}
+
+func collectDirectives(pass *analysis.Pass) []*directive {
+	var directives []*directive
+	for _, f := range pass.Files {
+		for _, cg := range f.Comments {
+			filewide := cg.Pos() < f.Package
+			for _, c := range cg.List {
+				if d := parseDirective(c.Text, c.Pos(), pass.Fset.Position(c.Pos()).Line, filewide, f.Pos()); d != nil {
+					directives = append(directives, d)
+				}
+			}
+		}
 	}
-	file := fileForPos(pass, fn.Pos())
-	if file == nil {
+	return directives
+}
+
+func parseDirective(text string, pos token.Pos, line int, filewide bool, filePos token.Pos) *directive {
+	idx := strings.Index(text, "errwrap:")
+	if idx < 0 {
+		return nil
+	}
+	rule := text[idx+len("errwrap:"):]
+	if i := strings.IndexAny(rule, " \t"); i >= 0 {
+		rule = rule[:i]
+	}
+	d := &directive{pos: pos, file: filePos, line: line}
+	if filewide {
+		d.line = -1
+	}
+	switch rule {
+	case "ignore":
+		return d
+	case ruleUnwrapped, ruleDirectCall:
+		d.rules = []string{rule}
+		return d
+	}
+	return nil
+}
+
+func checkFunction(pass *analysis.Pass, fn *ssa.Function, directives []*directive) {
+	if fn.Syntax() == nil {
 		return
 	}
 	errIdx := errorResultIndex(fn.Signature)
 	if errIdx < 0 {
 		return
 	}
+	filePos := pass.Files[0].Pos()
+	for _, f := range pass.Files {
+		if f.Pos() <= fn.Pos() && fn.Pos() < f.End() {
+			filePos = f.Pos()
+			break
+		}
+	}
+	fnLine := pass.Fset.Position(fn.Pos()).Line
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			ret, ok := instr.(*ssa.Return)
@@ -81,12 +140,28 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
 				continue
 			}
 			if rule := checkValue(ret.Results[errIdx], make(map[ssa.Value]bool)); rule != "" {
-				if !isSuppressed(file, pass.Fset, fn.Pos(), ret.Pos(), rule) {
+				retLine := pass.Fset.Position(ret.Pos()).Line
+				if !markSuppressed(directives, filePos, fnLine, retLine, rule) {
 					pass.Report(analysis.Diagnostic{Pos: ret.Pos(), Message: ruleMessages[rule]})
 				}
 			}
 		}
 	}
+}
+
+func markSuppressed(directives []*directive, filePos token.Pos, fnLine, retLine int, rule string) bool {
+	for _, d := range directives {
+		if d.file != filePos {
+			continue
+		}
+		if d.line < 0 || d.line == fnLine || d.line == fnLine-1 || d.line == retLine || d.line == retLine-1 {
+			if len(d.rules) == 0 || slices.Contains(d.rules, rule) {
+				d.used = true
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func errorResultIndex(sig *types.Signature) int {
@@ -251,39 +326,4 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 func isNilConst(v ssa.Value) bool {
 	c, ok := v.(*ssa.Const)
 	return ok && c.IsNil()
-}
-
-func fileForPos(pass *analysis.Pass, pos token.Pos) *ast.File {
-	for _, f := range pass.Files {
-		if pass.Fset.Position(f.Pos()).Filename == pass.Fset.Position(pos).Filename {
-			return f
-		}
-	}
-	return nil
-}
-
-func isSuppressed(f *ast.File, fset *token.FileSet, fnPos, retPos token.Pos, rule string) bool {
-	fnLine := fset.Position(fnPos).Line
-	retLine := fset.Position(retPos).Line
-	for _, cg := range f.Comments {
-		if cg.Pos() < f.Package {
-			for _, c := range cg.List {
-				if matchesDirective(c.Text, rule) {
-					return true
-				}
-			}
-			continue
-		}
-		for _, c := range cg.List {
-			cline := fset.Position(c.Pos()).Line
-			if (cline == fnLine || cline == fnLine-1 || cline == retLine || cline == retLine-1) && matchesDirective(c.Text, rule) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func matchesDirective(comment, rule string) bool {
-	return strings.Contains(comment, "errwrap:ignore") || strings.Contains(comment, "errwrap:"+rule)
 }
