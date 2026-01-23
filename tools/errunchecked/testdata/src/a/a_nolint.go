@@ -1,8 +1,8 @@
-//errdirectcall:unchecked
+//errunchecked:wrap
 package a
 
 import "github.com/graxinc/errutil"
 
-func directCallInNolintFile() error {
+func uncheckedWrapInNolintFile() error {
 	return errutil.With(returnsErr())
 }

@@ -129,7 +129,7 @@ Rules:
 
 Suppress with `//errwrap:unwrapped` or `//errwrap:new` on the line, above it, on the function, or before the `package` declaration (file-wide).
 
-### errdirectcall
+### errunchecked
 
 Ensures `errutil.With`/`Wrap` is not called directly on a function call result without a nil check.
 
@@ -146,20 +146,20 @@ if err := f(); err != nil {
 return nil
 ```
 
-Suppress with `//errdirectcall:unchecked` on the call line, above it, on the function, or before the `package` declaration (file-wide).
+Suppress with `//errunchecked:wrap` on the call line, above it, on the function, or before the `package` declaration (file-wide).
 
 ### Install
 
 ```bash
 go install github.com/graxinc/errutil/tools/errwrap/cmd/errwrap@latest
-go install github.com/graxinc/errutil/tools/errdirectcall/cmd/errdirectcall@latest
+go install github.com/graxinc/errutil/tools/errunchecked/cmd/errunchecked@latest
 ```
 
 ### Run
 
 ```bash
 errwrap ./...
-errdirectcall ./...
+errunchecked ./...
 ```
 
 Both tools flag unneccessary directives as failures.

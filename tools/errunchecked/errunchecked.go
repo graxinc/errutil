@@ -1,6 +1,6 @@
-// Package errdirectcall provides a Go analyzer that detects when errutil.With or errutil.Wrap
+// Package errunchecked provides a Go analyzer that detects when errutil.With or errutil.Wrap
 // is called directly on a function call result without first checking for nil.
-package errdirectcall
+package errunchecked
 
 import (
 	"go/token"
@@ -12,11 +12,11 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-const directivePrefix = "errdirectcall:unchecked"
+const directivePrefix = "errunchecked:wrap"
 
 func Analyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
-		Name:     "errdirectcall",
+		Name:     "errunchecked",
 		Doc:      "check that errutil.With/Wrap is not called directly on function results without nil check",
 		Requires: []*analysis.Analyzer{buildssa.Analyzer},
 		Run:      run,
@@ -31,7 +31,7 @@ func run(pass *analysis.Pass) (any, error) {
 		checkFunction(pass, fn, directives)
 	})
 
-	shared.ReportUnused(pass, directives, "unused errdirectcall:unchecked directive")
+	shared.ReportUnused(pass, directives, "unused errunchecked:wrap directive")
 	return nil, nil
 }
 

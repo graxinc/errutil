@@ -1,4 +1,4 @@
-//errdirectcall:unchecked // want `unused errdirectcall:unchecked directive`
+//errunchecked:wrap // want `unused errunchecked:wrap directive`
 package a
 
 import "github.com/graxinc/errutil"

@@ -71,23 +71,23 @@ func goodWrapNil() error {
 
 // Good: directive on same line
 func goodDirectiveSameLine() error {
-	return errutil.With(returnsErr()) //errdirectcall:unchecked
+	return errutil.With(returnsErr()) //errunchecked:wrap
 }
 
 // Good: directive on line above
 func goodDirectiveAbove() error {
-	//errdirectcall:unchecked
+	//errunchecked:wrap
 	return errutil.With(returnsErr())
 }
 
 // Good: directive on function
-//errdirectcall:unchecked
+//errunchecked:wrap
 func goodDirectiveOnFunc() error {
 	return errutil.With(returnsErr())
 }
 
 // Unused directive
 func badUnusedDirective(err error) error {
-	//errdirectcall:unchecked // want `unused errdirectcall:unchecked directive`
+	//errunchecked:wrap // want `unused errunchecked:wrap directive`
 	return errutil.With(err)
 }

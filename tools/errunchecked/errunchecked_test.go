@@ -1,4 +1,4 @@
-package errdirectcall
+package errunchecked
 
 import (
 	"testing"
