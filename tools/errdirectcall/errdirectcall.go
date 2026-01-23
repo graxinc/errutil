@@ -97,6 +97,21 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 				}
 				continue
 			}
+
+			// Check for errors.Is/errors.As calls - if true branch, error is non-nil
+			if call, ok := ifInstr.Cond.(*ssa.Call); ok {
+				if isErrorsIsOrAs(call, v) {
+					trueBlock := pred.Succs[0]
+					if trueBlock == b || slices.Contains(b.Preds, trueBlock) {
+						return true
+					}
+				}
+				if walk(pred) {
+					return true
+				}
+				continue
+			}
+
 			binOp, ok := ifInstr.Cond.(*ssa.BinOp)
 			if !ok {
 				if walk(pred) {
@@ -131,6 +146,24 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 		return false
 	}
 	return walk(block)
+}
+
+// isErrorsIsOrAs checks if the call is errors.Is(v, ...) or errors.As(v, ...).
+func isErrorsIsOrAs(call *ssa.Call, v ssa.Value) bool {
+	callee := call.Call.StaticCallee()
+	if callee == nil || callee.Package() == nil {
+		return false
+	}
+	if callee.Package().Pkg.Path() != "errors" {
+		return false
+	}
+	if callee.Name() != "Is" && callee.Name() != "As" {
+		return false
+	}
+	if len(call.Call.Args) == 0 {
+		return false
+	}
+	return call.Call.Args[0] == v
 }
 
 func isNilConst(v ssa.Value) bool {
