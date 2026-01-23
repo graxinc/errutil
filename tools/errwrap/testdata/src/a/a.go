@@ -57,6 +57,16 @@ func goodUnwrappedRule(err error) error {
 	return err //errwrap:unwrapped
 }
 
+func badUnwrappedDirectiveDoesNotMaskDirectcall(f func() error) error {
+	//errwrap:unwrapped
+	return errutil.With(f()) // want `do not directly wrap`
+}
+
+func badDirectcallDirectiveDoesNotMaskUnwrapped(err error) error {
+	//errwrap:directcall
+	return err // want `error should be wrapped`
+}
+
 // Unwrapped returns
 func badParameter(err error) error {
 	return err // want `error should be wrapped`
