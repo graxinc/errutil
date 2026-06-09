@@ -39,43 +39,34 @@ func run(pass *analysis.Pass) (any, error) {
 }
 
 func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, newDirectives []*shared.Directive) {
-	if fn.Syntax() == nil {
+	errIndices := shared.ErrorResultIndices(fn.Signature)
+	if len(errIndices) == 0 {
 		return
 	}
-	errIdx := shared.ErrorResultIndex(fn.Signature)
-	if errIdx < 0 {
+	ctx, ok := shared.NewFuncContext(pass, fn)
+	if !ok {
 		return
 	}
-	filePos := shared.FileForPos(pass, fn.Pos())
-	fnLine := pass.Fset.Position(fn.Pos()).Line
-
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			// Check for wrapping error constructors (errors.New, fmt.Errorf)
 			if call, ok := instr.(*ssa.Call); ok && call.Pos().IsValid() {
 				if shared.WrapsErrorConstructor(call) {
-					callLine := pass.Fset.Position(call.Pos()).Line
-					if !shared.MarkSuppressed(newDirectives, filePos, fnLine, callLine) {
-						pass.Report(analysis.Diagnostic{
-							Pos:     call.Pos(),
-							Message: "use errutil.New instead of wrapping errors.New or fmt.Errorf",
-						})
-					}
+					ctx.Report(newDirectives, call.Pos(), "use errutil.New instead of wrapping errors.New or fmt.Errorf")
 				}
 			}
 
 			// Check for unwrapped error returns
 			ret, ok := instr.(*ssa.Return)
-			if !ok || !ret.Pos().IsValid() || errIdx >= len(ret.Results) {
+			if !ok || !ret.Pos().IsValid() {
 				continue
 			}
-			if !isWrapped(ret.Results[errIdx], make(map[ssa.Value]bool)) {
-				retLine := pass.Fset.Position(ret.Pos()).Line
-				if !shared.MarkSuppressed(unwrappedDirectives, filePos, fnLine, retLine) {
-					pass.Report(analysis.Diagnostic{
-						Pos:     ret.Pos(),
-						Message: "error should be wrapped with errutil.With or errutil.Wrap",
-					})
+			for _, errIdx := range errIndices {
+				if errIdx >= len(ret.Results) {
+					continue
+				}
+				if !isWrapped(ret.Results[errIdx], make(map[ssa.Value]bool)) {
+					ctx.Report(unwrappedDirectives, ret.Pos(), "error should be wrapped with errutil.With or errutil.Wrap")
 				}
 			}
 		}
@@ -83,6 +74,9 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, n
 }
 
 func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
+	// A nil value is a nil error (fine to return unwrapped); an already-visited
+	// value means we are following a cycle (e.g. a phi feeding itself), which we
+	// treat as wrapped so the recursion terminates without a false positive.
 	if v == nil || visited[v] {
 		return true
 	}
@@ -101,7 +95,7 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 		}
 		return true
 	case *ssa.Extract:
-		if call, ok := val.Tuple.(*ssa.Call); ok {
+		if call, ok := shared.UnderlyingCall(val); ok {
 			return shared.IsErrUtilCall(call)
 		}
 	case *ssa.MakeInterface:
@@ -123,13 +117,20 @@ func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa
 	if alloc.Referrers() == nil {
 		return false
 	}
+	// If the load's block contains stores, the last one (in instruction order)
+	// dominates the load, so only its value matters — earlier stores are overwritten.
 	if loadBlock != nil {
-		for _, ref := range *alloc.Referrers() {
-			if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc && store.Block() == loadBlock {
-				return isWrapped(store.Val, visited)
+		var lastStore *ssa.Store
+		for _, instr := range loadBlock.Instrs {
+			if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
+				lastStore = store
 			}
 		}
+		if lastStore != nil {
+			return isWrapped(lastStore.Val, visited)
+		}
 	}
+	// Fallback: check all stores across all blocks.
 	for _, ref := range *alloc.Referrers() {
 		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
 			if !isWrapped(store.Val, visited) {

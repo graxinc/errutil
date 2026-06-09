@@ -2,6 +2,7 @@
 package shared
 
 import (
+	"go/ast"
 	"go/token"
 	"go/types"
 	"strings"
@@ -14,10 +15,11 @@ const ErrUtilPkg = "github.com/graxinc/errutil"
 
 // Directive represents an analyzer directive comment.
 type Directive struct {
-	Pos  token.Pos
-	File token.Pos
-	Line int // -1 for filewide
-	Used bool
+	Pos   token.Pos
+	File  *token.File
+	Line  int       // -1 for filewide
+	Owner token.Pos // Pos of the syntax node of the function this directive belongs to; NoPos if none/filewide.
+	Used  bool
 }
 
 // CollectDirectives finds all directives matching the given prefix (e.g., "errwrap:ignore").
@@ -28,9 +30,12 @@ func CollectDirectives(pass *analysis.Pass, prefix string) []*Directive {
 			filewide := cg.Pos() < f.Package
 			for _, c := range cg.List {
 				if isDirective(c.Text, prefix) {
-					d := &Directive{Pos: c.Pos(), File: f.Pos(), Line: pass.Fset.Position(c.Pos()).Line}
+					line := pass.Fset.Position(c.Pos()).Line
+					d := &Directive{Pos: c.Pos(), File: pass.Fset.File(c.Pos()), Line: line}
 					if filewide {
 						d.Line = -1
+					} else {
+						d.Owner = ownerFunc(pass, f, cg, line)
 					}
 					directives = append(directives, d)
 				}
@@ -40,22 +45,108 @@ func CollectDirectives(pass *analysis.Pass, prefix string) []*Directive {
 	return directives
 }
 
-// isDirective checks if a comment is a directive (starts with the prefix after //).
-func isDirective(text, prefix string) bool {
-	// Comment text includes the // prefix
-	text = strings.TrimPrefix(text, "//")
-	text = strings.TrimLeft(text, " \t")
-	return strings.HasPrefix(text, prefix)
+// ownerFunc returns the Pos of the function a directive belongs to: the function
+// whose doc comment is the directive, or the innermost function whose line span
+// contains the directive. Returns NoPos if the directive is not associated with a function.
+func ownerFunc(pass *analysis.Pass, f *ast.File, cg *ast.CommentGroup, line int) token.Pos {
+	owner := token.NoPos
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch fn := n.(type) {
+		case *ast.FuncDecl:
+			if fn.Doc == cg {
+				owner = fn.Pos()
+				return false
+			}
+			if funcLineSpanContains(pass, fn, line) {
+				owner = fn.Pos()
+			}
+		case *ast.FuncLit:
+			if funcLineSpanContains(pass, fn, line) {
+				owner = fn.Pos()
+			}
+		}
+		return true
+	})
+	return owner
 }
 
-// MarkSuppressed checks if a diagnostic at the given position should be suppressed.
-// Returns true if suppressed, and marks the directive as used.
-func MarkSuppressed(directives []*Directive, filePos token.Pos, fnLine, targetLine int) bool {
+func funcLineSpanContains(pass *analysis.Pass, n ast.Node, line int) bool {
+	start := pass.Fset.Position(n.Pos()).Line
+	end := pass.Fset.Position(n.End()).Line
+	return line >= start && line <= end
+}
+
+// isDirective checks if a comment is a directive (starts with the prefix after //).
+func isDirective(text, prefix string) bool {
+	// Comment text includes the // marker.
+	text = strings.TrimPrefix(text, "//")
+	text = strings.TrimLeft(text, " \t")
+	rest, ok := strings.CutPrefix(text, prefix)
+	if !ok {
+		return false
+	}
+	// Require a word boundary so "errwrap:unwrapped" does not match
+	// "errwrap:unwrappedtypo": the prefix must be the whole token, followed by
+	// end-of-comment or a non-identifier character (whitespace, arguments, etc.).
+	return rest == "" || !isIdentChar(rest[0])
+}
+
+func isIdentChar(b byte) bool {
+	return b == '_' ||
+		'a' <= b && b <= 'z' ||
+		'A' <= b && b <= 'Z' ||
+		'0' <= b && b <= '9'
+}
+
+// FuncContext carries the per-function state needed to report suppressible
+// diagnostics. Build one per SSA function with NewFuncContext.
+type FuncContext struct {
+	pass   *analysis.Pass
+	file   *token.File
+	fnPos  token.Pos // Pos of the function's syntax node, for matching directive ownership.
+	fnLine int
+}
+
+// NewFuncContext builds the reporting context for fn. ok is false when fn has no
+// syntax (e.g. a synthetic wrapper), in which case there is nothing to report on.
+func NewFuncContext(pass *analysis.Pass, fn *ssa.Function) (ctx FuncContext, ok bool) {
+	if fn.Syntax() == nil {
+		return FuncContext{}, false
+	}
+	return FuncContext{
+		pass:   pass,
+		file:   pass.Fset.File(fn.Pos()),
+		fnPos:  fn.Syntax().Pos(),
+		fnLine: pass.Fset.Position(fn.Pos()).Line,
+	}, true
+}
+
+// Report emits a diagnostic at pos with the given message, unless one of the
+// directives suppresses it (in which case that directive is marked used).
+func (c FuncContext) Report(directives []*Directive, pos token.Pos, message string) {
+	line := c.pass.Fset.Position(pos).Line
+	if !c.suppressed(directives, line) {
+		c.pass.Report(analysis.Diagnostic{Pos: pos, Message: message})
+	}
+}
+
+func (c FuncContext) suppressed(directives []*Directive, targetLine int) bool {
 	for _, d := range directives {
-		if d.File != filePos {
+		if d.File != c.file {
 			continue
 		}
-		if d.Line < 0 || d.Line == fnLine || d.Line == fnLine-1 || d.Line == targetLine || d.Line == targetLine-1 {
+		if d.Line < 0 { // filewide
+			d.Used = true
+			return true
+		}
+		// A line-level directive only suppresses diagnostics in the function it belongs to.
+		if d.Owner != c.fnPos {
+			continue
+		}
+		// A directive sits on, or one line above, either the function declaration
+		// (suppressing the whole function) or the specific diagnostic line.
+		near := func(line int) bool { return d.Line == line || d.Line == line-1 }
+		if near(c.fnLine) || near(targetLine) {
 			d.Used = true
 			return true
 		}
@@ -72,74 +163,68 @@ func ReportUnused(pass *analysis.Pass, directives []*Directive, message string) 
 	}
 }
 
-// FileForPos returns the file position for a given position.
-func FileForPos(pass *analysis.Pass, pos token.Pos) token.Pos {
-	for _, f := range pass.Files {
-		if f.Pos() <= pos && pos < f.End() {
-			return f.Pos()
-		}
+// CalleeInfo returns the package path and name of the call's static callee.
+// ok is false if the callee is not statically known (e.g. an interface method).
+func CalleeInfo(call *ssa.Call) (pkgPath, name string, ok bool) {
+	callee := call.Call.StaticCallee()
+	if callee == nil || callee.Package() == nil {
+		return "", "", false
 	}
-	if len(pass.Files) > 0 {
-		return pass.Files[0].Pos()
-	}
-	return token.NoPos
+	return callee.Package().Pkg.Path(), callee.Name(), true
 }
 
-// ErrorResultIndex returns the index of the error result in the signature, or -1 if none.
-func ErrorResultIndex(sig *types.Signature) int {
-	results := sig.Results()
-	if results == nil {
-		return -1
+// UnderlyingCall returns the *ssa.Call that produced v, whether v is that call
+// directly or an extraction of one of its results. ok is false otherwise.
+func UnderlyingCall(v ssa.Value) (call *ssa.Call, ok bool) {
+	switch val := v.(type) {
+	case *ssa.Call:
+		return val, true
+	case *ssa.Extract:
+		if c, ok := val.Tuple.(*ssa.Call); ok {
+			return c, true
+		}
 	}
-	errType := types.Universe.Lookup("error").Type()
+	return nil, false
+}
+
+var errType = types.Universe.Lookup("error").Type()
+
+// ErrorResultIndices returns the indices of all error results in the signature.
+func ErrorResultIndices(sig *types.Signature) []int {
+	results := sig.Results() // nil-safe: (*types.Tuple).Len reports 0 for a nil tuple.
+	var indices []int
 	for i := range results.Len() {
 		if types.Identical(results.At(i).Type(), errType) {
-			return i
+			indices = append(indices, i)
 		}
 	}
-	return -1
+	return indices
 }
 
-// HasErrorResult returns true if the signature has an error result.
-func HasErrorResult(sig *types.Signature) bool {
-	return ErrorResultIndex(sig) >= 0
-}
+// errUtilWrapFuncs is the set of errutil functions that wrap an existing error.
+// errutil.New constructs a new error and is therefore not included.
+var errUtilWrapFuncs = map[string]bool{"With": true, "Wrap": true, "Witht": true, "Wrapt": true}
 
-// IsErrUtilCall returns true if the call is to an errutil wrapping function.
-func IsErrUtilCall(call *ssa.Call) bool {
-	callee := call.Call.StaticCallee()
-	if callee == nil || callee.Package() == nil || callee.Package().Pkg.Path() != ErrUtilPkg {
+// isErrUtilCall reports whether call targets an errutil wrapping function, or
+// errutil.New when allowNew is set.
+func isErrUtilCall(call *ssa.Call, allowNew bool) bool {
+	pkg, name, ok := CalleeInfo(call)
+	if !ok || pkg != ErrUtilPkg {
 		return false
 	}
-	switch callee.Name() {
-	case "With", "Wrap", "Witht", "Wrapt", "New":
-		return true
-	}
-	return false
+	return errUtilWrapFuncs[name] || (allowNew && name == "New")
 }
+
+// IsErrUtilCall returns true if the call is to an errutil wrapping function or errutil.New.
+func IsErrUtilCall(call *ssa.Call) bool { return isErrUtilCall(call, true) }
 
 // IsErrUtilWrapCall returns true if the call is to errutil.With/Wrap/Witht/Wrapt (not New).
-func IsErrUtilWrapCall(call *ssa.Call) bool {
-	callee := call.Call.StaticCallee()
-	if callee == nil || callee.Package() == nil || callee.Package().Pkg.Path() != ErrUtilPkg {
-		return false
-	}
-	switch callee.Name() {
-	case "With", "Wrap", "Witht", "Wrapt":
-		return true
-	}
-	return false
-}
+func IsErrUtilWrapCall(call *ssa.Call) bool { return isErrUtilCall(call, false) }
 
 // IsErrorConstructor returns true if the call is errors.New or fmt.Errorf.
 func IsErrorConstructor(call *ssa.Call) bool {
-	callee := call.Call.StaticCallee()
-	if callee == nil || callee.Package() == nil {
-		return false
-	}
-	pkg := callee.Package().Pkg.Path()
-	name := callee.Name()
-	return (pkg == "errors" && name == "New") || (pkg == "fmt" && name == "Errorf")
+	pkg, name, ok := CalleeInfo(call)
+	return ok && ((pkg == "errors" && name == "New") || (pkg == "fmt" && name == "Errorf"))
 }
 
 // WrapsErrorConstructor returns true if the errutil.With/Wrap call wraps errors.New or fmt.Errorf.
@@ -147,16 +232,8 @@ func WrapsErrorConstructor(call *ssa.Call) bool {
 	if !IsErrUtilWrapCall(call) || len(call.Call.Args) == 0 {
 		return false
 	}
-	arg := call.Call.Args[0]
-	switch a := arg.(type) {
-	case *ssa.Call:
-		return IsErrorConstructor(a)
-	case *ssa.Extract:
-		if c, ok := a.Tuple.(*ssa.Call); ok {
-			return IsErrorConstructor(c)
-		}
-	}
-	return false
+	c, ok := UnderlyingCall(call.Call.Args[0])
+	return ok && IsErrorConstructor(c)
 }
 
 // WalkFunctions walks all functions in the SSA including anonymous functions.

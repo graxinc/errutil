@@ -44,6 +44,16 @@ func goodDirectiveOnFunc(err error) error {
 	return err
 }
 
+// A directive on a one-line function must not leak to the adjacent function below it.
+func goodDirectiveOneLiner(err error) error  { return err } //errwrap:unwrapped
+func badAdjacentToDirective(err error) error { return err } // want `error should be wrapped`
+
+// A near-miss directive name is not a real directive, so it must not suppress
+// (the error still fires) and must not be reported as an unused directive.
+func badNearMissDirective(err error) error {
+	return err //errwrap:unwrappedtypo // want `error should be wrapped`
+}
+
 // Bad: unwrapped returns
 func badParameter(err error) error {
 	return err // want `error should be wrapped`
@@ -122,6 +132,25 @@ func badReassignToUnwrapped() error {
 	return err // want `error should be wrapped`
 }
 
+func sinkErr(*error) {}
+
+// Addr-taken named return reassigned to a wrapped value: the final (dominating)
+// store is wrapped, so this must NOT be flagged even though an earlier store was unwrapped.
+func goodReassignAddrTaken() (err error) {
+	err = errors.New("")
+	err = errutil.With(err)
+	sinkErr(&err)
+	return
+}
+
+// Addr-taken named return whose final store is unwrapped: must be flagged.
+func badReassignAddrTaken() (err error) {
+	err = errutil.New(errutil.Tags{})
+	err = sentinel
+	sinkErr(&err)
+	return // want `error should be wrapped`
+}
+
 // Free variables (closure)
 func badFreeVar() func() error {
 	err := errors.New("")
@@ -179,4 +208,18 @@ func goodSuppressedNew() error {
 func badUnusedNewDirective(err error) error {
 	//errwrap:new // want `unused errwrap:new directive`
 	return errutil.With(err)
+}
+
+// Issue 4: second error in (error, error) return should also be checked
+func badMultiErrorSecond(a, b error) (error, error) {
+	return errutil.With(a), b // want `error should be wrapped`
+}
+
+// Issue 10: Witht/Wrapt wrapping constructors should trigger errwrap:new
+func badWithtErrorsNew() error {
+	return errutil.Witht(errors.New(""), errutil.Tags{}) // want `use errutil.New instead`
+}
+
+func badWraptFmtErrorf() error {
+	return errutil.Wrapt(fmt.Errorf(""), errutil.Tags{}) // want `use errutil.New instead`
 }

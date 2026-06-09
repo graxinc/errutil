@@ -4,7 +4,6 @@ package errunchecked
 
 import (
 	"go/token"
-	"slices"
 
 	"github.com/graxinc/errutil/tools/internal/shared"
 	"golang.org/x/tools/go/analysis"
@@ -36,12 +35,10 @@ func run(pass *analysis.Pass) (any, error) {
 }
 
 func checkFunction(pass *analysis.Pass, fn *ssa.Function, directives []*shared.Directive) {
-	if fn.Syntax() == nil || !shared.HasErrorResult(fn.Signature) {
+	ctx, ok := shared.NewFuncContext(pass, fn)
+	if !ok {
 		return
 	}
-	filePos := shared.FileForPos(pass, fn.Pos())
-	fnLine := pass.Fset.Position(fn.Pos()).Line
-
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			call, ok := instr.(*ssa.Call)
@@ -49,13 +46,7 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function, directives []*shared.D
 				continue
 			}
 			if isDirectWrapCall(call) {
-				callLine := pass.Fset.Position(call.Pos()).Line
-				if !shared.MarkSuppressed(directives, filePos, fnLine, callLine) {
-					pass.Report(analysis.Diagnostic{
-						Pos:     call.Pos(),
-						Message: "do not directly wrap function calls; check for nil first",
-					})
-				}
+				ctx.Report(directives, call.Pos(), "do not directly wrap function calls; check for nil first")
 			}
 		}
 	}
@@ -66,104 +57,96 @@ func isDirectWrapCall(call *ssa.Call) bool {
 		return false
 	}
 	arg := call.Call.Args[0]
-	switch a := arg.(type) {
-	case *ssa.Call:
-	case *ssa.Extract:
-		if _, ok := a.Tuple.(*ssa.Call); !ok {
-			return false
-		}
-	default:
+	inner, ok := shared.UnderlyingCall(arg)
+	if !ok {
+		return false
+	}
+	// errutil wrap/constructor functions and errors.New/fmt.Errorf never return a
+	// nil error, so wrapping their result needs no nil check. (A nested wrap thus
+	// flags only the inner call, on the raw function result.)
+	if shared.IsErrUtilCall(inner) || shared.IsErrorConstructor(inner) {
 		return false
 	}
 	return !isNilChecked(arg, call.Block())
 }
 
+// isNilChecked reports whether v is guaranteed non-nil at block. This holds when
+// a conditional that establishes v's nil-ness (a v != nil / v == nil test, an
+// equality against a sentinel, or errors.Is/As on v) guards block via establishes.
 func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
-	visited := make(map[*ssa.BasicBlock]bool)
-	var walk func(*ssa.BasicBlock) bool
-	walk = func(b *ssa.BasicBlock) bool {
-		if b == nil || visited[b] {
-			return false
+	for _, b := range block.Parent().Blocks {
+		if len(b.Instrs) == 0 {
+			continue
 		}
-		visited[b] = true
-		for _, pred := range b.Preds {
-			if len(pred.Instrs) == 0 {
-				continue
-			}
-			ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
-			if !ok {
-				if walk(pred) {
-					return true
-				}
-				continue
-			}
-
-			// Check for errors.Is/errors.As calls - if true branch, error is non-nil
-			if call, ok := ifInstr.Cond.(*ssa.Call); ok {
-				if isErrorsIsOrAs(call, v) {
-					trueBlock := pred.Succs[0]
-					if trueBlock == b || slices.Contains(b.Preds, trueBlock) {
-						return true
-					}
-				}
-				if walk(pred) {
-					return true
-				}
-				continue
-			}
-
-			binOp, ok := ifInstr.Cond.(*ssa.BinOp)
-			if !ok {
-				if walk(pred) {
-					return true
-				}
-				continue
-			}
-			var checkedVal ssa.Value
-			if isNilConst(binOp.X) {
-				checkedVal = binOp.Y
-			} else if isNilConst(binOp.Y) {
-				checkedVal = binOp.X
-			}
-			if checkedVal != v {
-				if walk(pred) {
-					return true
-				}
-				continue
-			}
-			trueBlock, falseBlock := pred.Succs[0], pred.Succs[1]
-			switch binOp.Op {
-			case token.NEQ:
-				if trueBlock == b || slices.Contains(b.Preds, trueBlock) {
-					return true
-				}
-			case token.EQL:
-				if falseBlock == b || slices.Contains(b.Preds, falseBlock) {
-					return true
-				}
-			}
+		ifInstr, ok := b.Instrs[len(b.Instrs)-1].(*ssa.If)
+		if !ok {
+			continue
 		}
-		return false
+		trueBlock, falseBlock := b.Succs[0], b.Succs[1]
+
+		if call, ok := ifInstr.Cond.(*ssa.Call); ok {
+			if isErrorsIsOrAs(call, v) && establishes(trueBlock, block) {
+				return true
+			}
+			continue
+		}
+
+		binOp, ok := ifInstr.Cond.(*ssa.BinOp)
+		if !ok || (binOp.Op != token.EQL && binOp.Op != token.NEQ) {
+			continue
+		}
+		var other ssa.Value
+		switch {
+		case binOp.X == v:
+			other = binOp.Y
+		case binOp.Y == v:
+			other = binOp.X
+		default:
+			continue
+		}
+		equalBlock, notEqualBlock := trueBlock, falseBlock
+		if binOp.Op == token.NEQ {
+			equalBlock, notEqualBlock = falseBlock, trueBlock
+		}
+		// v != nil establishes non-nil on the not-equal branch. v == sentinel
+		// establishes it on the equal branch (a nil sentinel is treated as a
+		// deliberate check too; that case is rare and indistinguishable statically).
+		nonNilBlock := equalBlock
+		if isNilConst(other) {
+			nonNilBlock = notEqualBlock
+		}
+		if establishes(nonNilBlock, block) {
+			return true
+		}
 	}
-	return walk(block)
+	return false
 }
 
-// isErrorsIsOrAs checks if the call is errors.Is(v, ...) or errors.As(v, ...).
+// establishes reports whether a property that holds on branch is guaranteed to
+// hold at block. branch must dominate block, and branch must have a single
+// predecessor so it is entered only via its conditional edge (see isNilChecked).
+func establishes(branch, block *ssa.BasicBlock) bool {
+	return len(branch.Preds) == 1 && branch.Dominates(block)
+}
+
+// isErrorsIsOrAs checks if the call is errors.Is(v, target) or errors.As(v, ...)
+// in a form that, when true, implies v is non-nil. errors.Is(v, nil) is excluded
+// because it is true exactly when v is nil.
 func isErrorsIsOrAs(call *ssa.Call, v ssa.Value) bool {
-	callee := call.Call.StaticCallee()
-	if callee == nil || callee.Package() == nil {
+	pkg, name, ok := shared.CalleeInfo(call)
+	if !ok || pkg != "errors" || (name != "Is" && name != "As") {
 		return false
 	}
-	if callee.Package().Pkg.Path() != "errors" {
+	args := call.Call.Args
+	if len(args) == 0 || args[0] != v {
 		return false
 	}
-	if callee.Name() != "Is" && callee.Name() != "As" {
+	// errors.Is(v, nil) is true only when v IS nil. (errors.As's target is a
+	// non-nil pointer, so it has no equivalent case.)
+	if name == "Is" && len(args) >= 2 && isNilConst(args[1]) {
 		return false
 	}
-	if len(call.Call.Args) == 0 {
-		return false
-	}
-	return call.Call.Args[0] == v
+	return true
 }
 
 func isNilConst(v ssa.Value) bool {
