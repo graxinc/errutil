@@ -8,7 +8,6 @@ import (
 	"path"
 	"runtime"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 )
@@ -98,7 +97,7 @@ func With(err error) error {
 }
 
 // Witht is like With but adds tags t to the error information.
-func Witht(err error, t Tags) error { //nolint:misspell
+func Witht(err error, t Tags) error {
 	return NewFrameError(Caller(1), t, err, false)
 }
 
@@ -226,7 +225,7 @@ func (f StackFrame) String() string {
 
 	var contextPairs []string
 	keys := slices.Collect(maps.Keys(f.Values))
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for _, k := range keys {
 		contextPairs = append(contextPairs, k+"="+tagValue(f.Values[k]))
 	}

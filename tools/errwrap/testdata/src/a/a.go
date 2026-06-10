@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
 
 	"github.com/graxinc/errutil"
 )
@@ -335,4 +336,14 @@ func goodMultilineReturnDirective(a, b error) (error, error) {
 func badDirectiveBelowReturn(err error) error {
 	return err // want `error should be wrapped`
 	//errwrap:unwrapped // want `unused errwrap:unwrapped directive`
+}
+
+func exits() { os.Exit(1) }
+
+// Good (by construction): a return after a never-returning call is pruned as
+// unreachable by the SSA builder (x/tools ≥ v0.45 interprocedural no-return
+// analysis), so it is not checked.
+func goodUnreachableReturn(err error) error {
+	exits()
+	return err
 }

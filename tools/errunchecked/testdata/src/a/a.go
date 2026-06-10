@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 
 	"github.com/graxinc/errutil"
 )
@@ -754,6 +755,16 @@ func goodDirectiveMultilineArgLine() error {
 func badDirectiveBelow() error {
 	return errutil.With(returnsErr()) // want `do not directly wrap`
 	//errunchecked:wrap // want `unused errunchecked:wrap directive`
+}
+
+func exits() { os.Exit(1) }
+
+// Good (by construction): code after a call to a never-returning function is
+// pruned as unreachable by the SSA builder (x/tools ≥ v0.45 interprocedural
+// no-return analysis), so the wrap can never execute and is not flagged.
+func goodWrapAfterNoReturn() {
+	exits()
+	_ = errutil.With(returnsErr())
 }
 
 // In a nested multiline wrap only the inner call is flagged (the outer wraps a

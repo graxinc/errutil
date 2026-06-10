@@ -28,7 +28,10 @@ func Analyzer() *analysis.Analyzer {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	ssaInfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	if !ok {
+		return nil, fmt.Errorf("unexpected buildssa result type %T", pass.ResultOf[buildssa.Analyzer])
+	}
 	directives := shared.CollectDirectives(pass, directivePrefix)
 
 	c := &checker{pass: pass, memo: map[funcResult]bool{}, inProgress: map[funcResult]bool{}}

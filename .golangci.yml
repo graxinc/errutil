@@ -1,0 +1,129 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errname
+    - funlen
+    - gocyclo
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - nolintlint
+    - paralleltest
+    - revive
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - whitespace
+  settings:
+    dupl:
+      threshold: 100
+    funlen:
+      lines: 400
+      statements: 200
+    gocritic:
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+        - wrapperFunc
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+    gocyclo:
+      min-complexity: 25
+    govet:
+      enable:
+        - nilness
+    lll:
+      line-length: 140
+    misspell:
+      locale: US
+      ignore-rules:
+        - Witht
+    nolintlint:
+      require-explanation: false
+      require-specific: false
+      allow-unused: false
+    paralleltest:
+      ignore-missing: true
+    revive:
+      enable-all-rules: true
+      rules:
+        - name: unused-parameter
+          disabled: true
+        - name: file-header
+          disabled: true
+        - name: banned-characters
+          disabled: true
+        - name: add-constant
+          disabled: true
+        - name: confusing-naming
+          disabled: true
+        - name: line-length-limit
+          disabled: true
+        - name: import-shadowing
+          disabled: true
+        - name: flag-parameter
+          disabled: true
+        - name: cyclomatic
+          disabled: true
+        - name: cognitive-complexity
+          disabled: true
+        - name: function-length
+          disabled: true
+        - name: nested-structs
+          disabled: true
+        - name: redefines-builtin-id
+          disabled: true
+        - name: enforce-switch-style
+          disabled: true
+        - name: unhandled-error
+          arguments:
+            - flag\.FlagSet\.Parse
+            - fmt\.Print(ln|f)?
+            - fmt\.Scan(ln|f)
+        - name: argument-limit
+          arguments:
+            - 12
+        - name: max-public-structs
+          arguments:
+            - 50
+        - name: function-result-limit
+          arguments:
+            - 5
+    unused:
+      exported-fields-are-used: false
+      local-variables-are-used: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: _test.go
+        text: 'G404: Use of weak random number generator'
+      - path: (.+)\.go$
+        text: 'G115: integer overflow conversion'
+    paths:
+      # Fixture packages exercising unusual import paths and package names.
+      - ^test/
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax

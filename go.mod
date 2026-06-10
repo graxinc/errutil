@@ -1,5 +1,5 @@
 module github.com/graxinc/errutil
 
-go 1.25
+go 1.26
 
-require github.com/google/go-cmp v0.5.9
+require github.com/google/go-cmp v0.7.0

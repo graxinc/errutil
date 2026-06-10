@@ -3,6 +3,7 @@
 package errwrap
 
 import (
+	"fmt"
 	"go/token"
 
 	"github.com/graxinc/errutil/tools/internal/shared"
@@ -27,7 +28,10 @@ func Analyzer() *analysis.Analyzer {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	ssaInfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	if !ok {
+		return nil, fmt.Errorf("unexpected buildssa result type %T", pass.ResultOf[buildssa.Analyzer])
+	}
 	unwrappedDirectives := shared.CollectDirectives(pass, directiveUnwrapped)
 	newDirectives := shared.CollectDirectives(pass, directiveNew)
 
@@ -145,7 +149,10 @@ func deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited 
 			if !ok {
 				continue
 			}
-			closure := mc.Fn.(*ssa.Function)
+			closure, ok := mc.Fn.(*ssa.Function)
+			if !ok {
+				continue
+			}
 			for i, binding := range mc.Bindings {
 				if binding != alloc {
 					continue
