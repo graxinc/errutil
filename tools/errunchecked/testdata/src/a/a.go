@@ -115,7 +115,7 @@ func goodDirectiveOnFunc() error {
 	return errutil.With(returnsErr())
 }
 
-// Issue 7: multi-return extraction still flagged as direct wrap without nil check
+// Bad: an error extracted from a multi-result call is a direct call result too.
 func returnsTwoValues() (int, error) { return 0, nil }
 
 func badWrapMultiReturnExtract() error {
@@ -123,7 +123,7 @@ func badWrapMultiReturnExtract() error {
 	return errutil.With(err) // want `do not directly wrap`
 }
 
-// Issue 3: function without error return should still be checked
+// Bad: functions without error results are still checked.
 func badNoErrorReturn() {
 	_ = errutil.With(returnsErr()) // want `do not directly wrap`
 }

@@ -211,12 +211,12 @@ func badUnusedNewDirective(err error) error {
 	return errutil.With(err)
 }
 
-// Issue 4: second error in (error, error) return should also be checked
+// Bad: every error in an (error, error) return is checked, not just the first.
 func badMultiErrorSecond(a, b error) (error, error) {
 	return errutil.With(a), b // want `error should be wrapped`
 }
 
-// Issue 10: Witht/Wrapt wrapping constructors should trigger errwrap:new
+// Bad: Witht/Wrapt wrapping constructors trigger errwrap:new like With/Wrap.
 func badWithtErrorsNew() error {
 	return errutil.Witht(errors.New(""), errutil.Tags{}) // want `use errutil.New instead`
 }
