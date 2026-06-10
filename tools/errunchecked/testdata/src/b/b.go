@@ -52,6 +52,11 @@ func goodWrapDepGeneric() error {
 	return errutil.With(dep.GenericAlways[int]())
 }
 
+// Good: the nil-guard proof carries across packages like any other fact.
+func goodWrapDepNilGuarded() error {
+	return errutil.With(dep.NilGuarded(true))
+}
+
 // Good: facts from generated files still vouch for handwritten callers.
 func goodWrapDepGenerated() error {
 	return errutil.With(dep.GeneratedAlwaysErr())

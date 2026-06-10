@@ -339,6 +339,58 @@ func badWrapMaybeErr() error {
 	return errutil.With(maybeErr(true)) // want `do not directly wrap`
 }
 
+// nilGuardedErr returns non-nil on every path even though the inner call is
+// not provably non-nil: the unprovable result is returned only under a
+// dominating nil check, and the fallback is a constructor. This is the
+// boundary-helper shape for wrapping third-party constructors that route
+// through replaceable function variables.
+func nilGuardedErr(b bool) error {
+	if err := maybeErr(b); err != nil {
+		return err
+	}
+	return errutil.New(nil)
+}
+
+// Good: wrapping a nil-guard-proved helper needs no nil check at the call site.
+func goodWrapNilGuardedErr() error {
+	return errutil.With(nilGuardedErr(true))
+}
+
+// partialGuard guards one return but not the other.
+func partialGuard(b bool) error {
+	if err := maybeErr(b); err != nil {
+		return err
+	}
+	return maybeErr(!b)
+}
+
+// Bad: a single unguarded return defeats the proof.
+func badWrapPartialGuard() error {
+	return errutil.With(partialGuard(true)) // want `do not directly wrap`
+}
+
+// maybeErrIface can return a nil defined-interface error.
+func maybeErrIface(b bool) errIface {
+	if b {
+		return customErr{}
+	}
+	return nil
+}
+
+// nilGuardedIfaceErr returns a converted value: the nil check is on the
+// pre-conversion errIface value, and the proof looks through the conversion.
+func nilGuardedIfaceErr(b bool) error {
+	if err := maybeErrIface(b); err != nil {
+		return err
+	}
+	return errutil.New(nil)
+}
+
+// Good: the nil-guard proof composes with interface conversions.
+func goodWrapNilGuardedIface() error {
+	return errutil.With(nilGuardedIfaceErr(true))
+}
+
 // forwardsErr forwards a non-nil call's result directly (a tail call). SSA
 // expands `return alwaysErr()` into an extract, which valueNonNil recognizes.
 func forwardsErr() error {

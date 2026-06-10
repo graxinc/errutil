@@ -33,6 +33,15 @@ func MaybeErr(b bool) error {
 	return nil
 }
 
+// NilGuarded proves non-nil via a dominating nil check rather than by
+// construction — the boundary-helper shape for unprovable callees.
+func NilGuarded(b bool) error { // want NilGuarded:`nonNilError\[0\]`
+	if err := MaybeErr(b); err != nil {
+		return err
+	}
+	return errutil.New(nil)
+}
+
 type boxErr struct{}
 
 func (boxErr) Error() string { return "" }

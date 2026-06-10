@@ -93,14 +93,13 @@ func (c *checker) isDirectWrapCall(call ssa.CallInstruction) bool {
 	if !shared.IsErrUtilWrapCall(call) || len(args) == 0 {
 		return false
 	}
-	// Interface-to-interface conversions preserve nil-ness exactly, so look
-	// through them: a nil check or non-nil proof on the converted value or on
-	// any value it came through makes the wrap safe.
-	candidates := []ssa.Value{args[0]}
-	for src := conversionSource(candidates[len(candidates)-1]); src != nil; src = conversionSource(src) {
-		candidates = append(candidates, src)
+	// Interface-to-interface conversions preserve nil-ness exactly, so the
+	// wrapped value is in scope only if a call underlies the conversion chain.
+	base := args[0]
+	for src := conversionSource(base); src != nil; src = conversionSource(src) {
+		base = src
 	}
-	inner, ok := shared.UnderlyingCall(candidates[len(candidates)-1])
+	inner, ok := shared.UnderlyingCall(base)
 	if !ok {
 		return false
 	}
@@ -109,15 +108,21 @@ func (c *checker) isDirectWrapCall(call ssa.CallInstruction) bool {
 	if isContextErrInDoneBranch(inner, call.Block()) {
 		return false
 	}
-	// A value guaranteed non-nil needs no nil check: errutil/standard constructors,
-	// or any function whose every return is a non-nil error (proved from its body,
-	// or imported as a fact when the callee is in another package).
-	for _, v := range candidates {
-		if c.valueNonNil(v) || isNilChecked(v, call.Block()) {
-			return false
+	return !c.provedNonNil(args[0], call.Block())
+}
+
+// provedNonNil reports whether v is provably non-nil at block: constructed
+// non-nil (errutil/standard constructors, or a callee whose every return is a
+// non-nil error — proved from its body, or imported as a fact cross-package),
+// or guarded by a dominating nil check. Nil-ness-preserving interface
+// conversions are looked through: a proof on any value in the chain suffices.
+func (c *checker) provedNonNil(v ssa.Value, block *ssa.BasicBlock) bool {
+	for ; v != nil; v = conversionSource(v) {
+		if c.valueNonNil(v) || isNilChecked(v, block) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // isContextErrInDoneBranch reports whether call is ctx.Err() and some block that
@@ -373,7 +378,11 @@ func (c *checker) computeResultNonNil(fn *ssa.Function, idx int) bool {
 			continue
 		}
 		sawReturn = true
-		if idx >= len(ret.Results) || !c.valueNonNil(ret.Results[idx]) {
+		// A nil-check-guarded return — the `if err != nil { return err }`
+		// shape — counts via provedNonNil, letting a helper vouch for an
+		// unprovable callee's result (e.g. one routed through a replaceable
+		// function variable) by guarding it.
+		if idx >= len(ret.Results) || !c.provedNonNil(ret.Results[idx], b) {
 			return false
 		}
 	}
