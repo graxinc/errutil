@@ -1,4 +1,4 @@
-//errwrap:unwrapped // want `unused errwrap:unwrapped directive`
+//errutil:unwrapped // want `unused errutil:unwrapped directive`
 package a
 
 import "github.com/graxinc/errutil"

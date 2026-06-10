@@ -22,7 +22,7 @@ type Directive struct {
 	Used  bool
 }
 
-// CollectDirectives finds all directives matching the given prefix (e.g., "errwrap:ignore").
+// CollectDirectives finds all directives matching the given prefix (e.g., "errutil:unwrapped").
 func CollectDirectives(pass *analysis.Pass, prefix string) []*Directive {
 	var directives []*Directive
 	for _, f := range pass.Files {
@@ -85,8 +85,8 @@ func isDirective(text, prefix string) bool {
 	if !ok {
 		return false
 	}
-	// Require a word boundary so "errwrap:unwrapped" does not match
-	// "errwrap:unwrappedtypo": the prefix must be the whole token, followed by
+	// Require a word boundary so "errutil:unwrapped" does not match
+	// "errutil:unwrappedtypo": the prefix must be the whole token, followed by
 	// end-of-comment or a non-identifier character (whitespace, arguments, etc.).
 	return rest == "" || !isIdentChar(rest[0])
 }

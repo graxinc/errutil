@@ -127,7 +127,7 @@ Rules:
 * **unwrapped** — returning errors without wrapping (`return err`, `return errors.New("x")`, etc.)
 * **new** — wrapping `errors.New` or `fmt.Errorf` instead of using `errutil.New`
 
-Suppress with `//errwrap:unwrapped` or `//errwrap:new` on any line of the statement (including later lines of a multiline call or return), the line above it, on the function, or before the `package` declaration (file-wide).
+Suppress with `//errutil:unwrapped` or `//errutil:new` on any line of the statement (including later lines of a multiline call or return), the line above it, on the function, or before the `package` declaration (file-wide).
 
 ### errunchecked
 
@@ -146,7 +146,7 @@ if err := f(); err != nil {
 return nil
 ```
 
-Suppress with `//errunchecked:wrap` on any line of the call (including later lines of a multiline call), the line above it, on the function, or before the `package` declaration (file-wide).
+Suppress with `//errutil:unchecked` on any line of the call (including later lines of a multiline call), the line above it, on the function, or before the `package` declaration (file-wide).
 
 ### Install
 

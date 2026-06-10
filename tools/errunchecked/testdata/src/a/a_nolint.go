@@ -1,4 +1,4 @@
-//errunchecked:wrap
+//errutil:unchecked
 package a
 
 import "github.com/graxinc/errutil"

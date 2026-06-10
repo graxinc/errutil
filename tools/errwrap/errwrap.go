@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	directiveUnwrapped = "errwrap:unwrapped"
-	directiveNew       = "errwrap:new"
+	directiveUnwrapped = "errutil:unwrapped"
+	directiveNew       = "errutil:new"
 )
 
 func Analyzer() *analysis.Analyzer {
@@ -43,8 +43,8 @@ func run(pass *analysis.Pass) (any, error) {
 		checkFunction(pass, fn, unwrappedDirectives, newDirectives)
 	})
 
-	shared.ReportUnused(pass, unwrappedDirectives, "unused errwrap:unwrapped directive")
-	shared.ReportUnused(pass, newDirectives, "unused errwrap:new directive")
+	shared.ReportUnused(pass, unwrappedDirectives, "unused errutil:unwrapped directive")
+	shared.ReportUnused(pass, newDirectives, "unused errutil:new directive")
 	return nil, nil
 }
 

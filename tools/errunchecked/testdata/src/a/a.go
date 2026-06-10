@@ -100,17 +100,17 @@ func goodWrapNil() error {
 
 // Good: directive on same line
 func goodDirectiveSameLine() error {
-	return errutil.With(returnsErr()) //errunchecked:wrap
+	return errutil.With(returnsErr()) //errutil:unchecked
 }
 
 // Good: directive on line above
 func goodDirectiveAbove() error {
-	//errunchecked:wrap
+	//errutil:unchecked
 	return errutil.With(returnsErr())
 }
 
 // Good: directive on function
-//errunchecked:wrap
+//errutil:unchecked
 func goodDirectiveOnFunc() error {
 	return errutil.With(returnsErr())
 }
@@ -130,13 +130,13 @@ func badNoErrorReturn() {
 
 // Unused directive
 func badUnusedDirective(err error) error {
-	//errunchecked:wrap // want `unused errunchecked:wrap directive`
+	//errutil:unchecked // want `unused errutil:unchecked directive`
 	return errutil.With(err)
 }
 
 // A near-miss directive name is not a real directive, so it must not suppress.
 func badNearMissDirective() error {
-	return errutil.With(returnsErr()) //errunchecked:wraptypo // want `do not directly wrap`
+	return errutil.With(returnsErr()) //errutil:uncheckedtypo // want `do not directly wrap`
 }
 
 // Bad: `||` short-circuit. The branch is also reachable when `other` is true and
@@ -413,7 +413,7 @@ func badWrapInClosure() func() error {
 // Good: a directive suppresses a wrap inside a closure.
 func goodDirectiveInClosure() func() error {
 	return func() error {
-		return errutil.With(returnsErr()) //errunchecked:wrap
+		return errutil.With(returnsErr()) //errutil:unchecked
 	}
 }
 
@@ -799,14 +799,14 @@ func badCtxErrDoubleCallDifferentCtx(ctx1, ctx2 context.Context) error {
 // anywhere within the call's span).
 func goodDirectiveMultilineArgLine() error {
 	return errutil.With(
-		returnsErr()) //errunchecked:wrap
+		returnsErr()) //errutil:unchecked
 }
 
 // A directive on the line below a single-line wrap call does not suppress; the
 // span only extends downward for calls that actually span multiple lines.
 func badDirectiveBelow() error {
 	return errutil.With(returnsErr()) // want `do not directly wrap`
-	//errunchecked:wrap // want `unused errunchecked:wrap directive`
+	//errutil:unchecked // want `unused errutil:unchecked directive`
 }
 
 func exits() { os.Exit(1) }
@@ -823,7 +823,7 @@ func goodWrapAfterNoReturn() {
 // non-nil Wrap result), and a directive on the inner call's line suppresses it.
 func goodDirectiveNestedMultiline() error {
 	return errutil.With(
-		errutil.Wrap(returnsErr()), //errunchecked:wrap
+		errutil.Wrap(returnsErr()), //errutil:unchecked
 	)
 }
 

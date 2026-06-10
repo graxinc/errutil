@@ -1,4 +1,4 @@
-//errwrap:new // want `unused errwrap:new directive`
+//errutil:new // want `unused errutil:new directive`
 package a
 
 import "github.com/graxinc/errutil"

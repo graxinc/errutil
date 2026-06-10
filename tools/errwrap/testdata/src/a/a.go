@@ -30,29 +30,29 @@ func goodNonError() string {
 
 // Good: directive on same line
 func goodDirectiveSameLine(err error) error {
-	return err //errwrap:unwrapped
+	return err //errutil:unwrapped
 }
 
 // Good: directive on line above
 func goodDirectiveAbove(err error) error {
-	//errwrap:unwrapped
+	//errutil:unwrapped
 	return err
 }
 
 // Good: directive on function
-//errwrap:unwrapped
+//errutil:unwrapped
 func goodDirectiveOnFunc(err error) error {
 	return err
 }
 
 // A directive on a one-line function must not leak to the adjacent function below it.
-func goodDirectiveOneLiner(err error) error  { return err } //errwrap:unwrapped
+func goodDirectiveOneLiner(err error) error  { return err } //errutil:unwrapped
 func badAdjacentToDirective(err error) error { return err } // want `error should be wrapped`
 
 // A near-miss directive name is not a real directive, so it must not suppress
 // (the error still fires) and must not be reported as an unused directive.
 func badNearMissDirective(err error) error {
-	return err //errwrap:unwrappedtypo // want `error should be wrapped`
+	return err //errutil:unwrappedtypo // want `error should be wrapped`
 }
 
 // Bad: unwrapped returns
@@ -187,11 +187,11 @@ func goodIterSeq(rows iter.Seq[error]) error {
 
 // Unused directive
 func badUnusedDirective(err error) error {
-	//errwrap:unwrapped // want `unused errwrap:unwrapped directive`
+	//errutil:unwrapped // want `unused errutil:unwrapped directive`
 	return errutil.With(err)
 }
 
-// Wrapping error constructors (errwrap:new rule)
+// Wrapping error constructors (errutil:new rule)
 func badWrapErrorsNew() error {
 	return errutil.With(errors.New("")) // want `use errutil.New instead`
 }
@@ -200,14 +200,14 @@ func badWrapFmtErrorf() error {
 	return errutil.Wrap(fmt.Errorf("")) // want `use errutil.New instead`
 }
 
-// Good: directive suppresses errwrap:new
-//errwrap:new
+// Good: directive suppresses errutil:new
+//errutil:new
 func goodSuppressedNew() error {
 	return errutil.With(errors.New(""))
 }
 
 func badUnusedNewDirective(err error) error {
-	//errwrap:new // want `unused errwrap:new directive`
+	//errutil:new // want `unused errutil:new directive`
 	return errutil.With(err)
 }
 
@@ -216,7 +216,7 @@ func badMultiErrorSecond(a, b error) (error, error) {
 	return errutil.With(a), b // want `error should be wrapped`
 }
 
-// Bad: Witht/Wrapt wrapping constructors trigger errwrap:new like With/Wrap.
+// Bad: Witht/Wrapt wrapping constructors trigger errutil:new like With/Wrap.
 func badWithtErrorsNew() error {
 	return errutil.Witht(errors.New(""), errutil.Tags{}) // want `use errutil.New instead`
 }
@@ -303,7 +303,7 @@ func badConditionalDeferWrap(cond bool) (err error) {
 	return // want `error should be wrapped`
 }
 
-// Bad: defer and go statements wrapping a constructor trigger errwrap:new too.
+// Bad: defer and go statements wrapping a constructor trigger errutil:new too.
 func badDeferNew() {
 	defer errutil.With(errors.New("")) // want `use errutil.New instead`
 }
@@ -312,7 +312,7 @@ func badGoNew() {
 	go errutil.With(errors.New("")) // want `use errutil.New instead`
 }
 
-// Bad: the errwrap:new rule applies in functions without error results.
+// Bad: the errutil:new rule applies in functions without error results.
 func badWrapNewNoErrorReturn() {
 	_ = errutil.With(errors.New("")) // want `use errutil.New instead`
 }
@@ -322,20 +322,20 @@ func badWrapNewNoErrorReturn() {
 // directive may sit anywhere within the call's span).
 func goodMultilineNewDirective() error {
 	return errutil.With(
-		errors.New("")) //errwrap:new
+		errors.New("")) //errutil:new
 }
 
 // Good: a directive on a later line of a multiline return statement suppresses.
 func goodMultilineReturnDirective(a, b error) (error, error) {
 	return errutil.With(a),
-		b //errwrap:unwrapped
+		b //errutil:unwrapped
 }
 
 // A directive on the line below a single-line return does not suppress; the
 // span only extends downward for statements that actually span multiple lines.
 func badDirectiveBelowReturn(err error) error {
 	return err // want `error should be wrapped`
-	//errwrap:unwrapped // want `unused errwrap:unwrapped directive`
+	//errutil:unwrapped // want `unused errutil:unwrapped directive`
 }
 
 func exits() { os.Exit(1) }

@@ -15,7 +15,7 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-const directivePrefix = "errunchecked:wrap"
+const directivePrefix = "errutil:unchecked"
 
 func Analyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
@@ -51,7 +51,7 @@ func run(pass *analysis.Pass) (any, error) {
 		c.checkFunction(fn, directives)
 	})
 
-	shared.ReportUnused(pass, directives, "unused errunchecked:wrap directive")
+	shared.ReportUnused(pass, directives, "unused errutil:unchecked directive")
 	return nil, nil
 }
 

@@ -1,4 +1,4 @@
-//errwrap:new
+//errutil:new
 package a
 
 import (
