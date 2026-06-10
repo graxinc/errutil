@@ -124,13 +124,25 @@ func NewFuncContext(pass *analysis.Pass, fn *ssa.Function) (ctx FuncContext, ok 
 // Report emits a diagnostic at pos with the given message, unless one of the
 // directives suppresses it (in which case that directive is marked used).
 func (c FuncContext) Report(directives []*Directive, pos token.Pos, message string) {
-	line := c.pass.Fset.Position(pos).Line
-	if !c.suppressed(directives, line) {
+	c.ReportRange(directives, pos, token.NoPos, message)
+}
+
+// ReportRange is Report for a diagnostic whose subject spans [pos, end], such
+// as a multiline call: a directive on any line of the span suppresses the
+// diagnostic, not just the line of pos. An invalid end means the span is the
+// single line of pos.
+func (c FuncContext) ReportRange(directives []*Directive, pos, end token.Pos, message string) {
+	start := c.pass.Fset.Position(pos).Line
+	last := start
+	if end.IsValid() {
+		last = c.pass.Fset.Position(end).Line
+	}
+	if !c.suppressed(directives, start, last) {
 		c.pass.Report(analysis.Diagnostic{Pos: pos, Message: message})
 	}
 }
 
-func (c FuncContext) suppressed(directives []*Directive, targetLine int) bool {
+func (c FuncContext) suppressed(directives []*Directive, targetStart, targetEnd int) bool {
 	for _, d := range directives {
 		if d.File != c.file {
 			continue
@@ -144,9 +156,10 @@ func (c FuncContext) suppressed(directives []*Directive, targetLine int) bool {
 			continue
 		}
 		// A directive sits on, or one line above, either the function declaration
-		// (suppressing the whole function) or the specific diagnostic line.
-		near := func(line int) bool { return d.Line == line || d.Line == line-1 }
-		if near(c.fnLine) || near(targetLine) {
+		// (suppressing the whole function) or the diagnostic's span (any line of a
+		// multiline subject).
+		if d.Line == c.fnLine || d.Line == c.fnLine-1 ||
+			(d.Line >= targetStart-1 && d.Line <= targetEnd) {
 			d.Used = true
 			return true
 		}
@@ -163,10 +176,58 @@ func ReportUnused(pass *analysis.Pass, directives []*Directive, message string) 
 	}
 }
 
+// GeneratedFiles returns the pass's files bearing the standard
+// "// Code generated ... DO NOT EDIT." marker. Diagnostics should not be
+// reported in generated files: they cannot be hand-fixed, and regeneration
+// would discard any directive placed in them.
+func GeneratedFiles(pass *analysis.Pass) map[*token.File]bool {
+	gen := map[*token.File]bool{}
+	for _, f := range pass.Files {
+		if ast.IsGenerated(f) {
+			gen[pass.Fset.File(f.Pos())] = true
+		}
+	}
+	return gen
+}
+
+// IsGeneratedFunc reports whether fn was declared in one of the generated
+// files. Safe for synthetic functions without positions (never generated).
+func IsGeneratedFunc(fn *ssa.Function, fset *token.FileSet, generated map[*token.File]bool) bool {
+	return generated[fset.File(fn.Pos())]
+}
+
+// SubjectEnds maps diagnostic subject positions to the subject's End, so a
+// directive on any line of a multiline subject can suppress its diagnostic via
+// ReportRange: call expressions are keyed by their Lparen (the position SSA
+// call instructions report) and return statements by the return keyword (the
+// position ssa.Return reports). The two position kinds cannot collide.
+func SubjectEnds(fn *ssa.Function) map[token.Pos]token.Pos {
+	ends := map[token.Pos]token.Pos{}
+	ast.Inspect(fn.Syntax(), func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			ends[n.Lparen] = n.End()
+		case *ast.ReturnStmt:
+			ends[n.Return] = n.End()
+		}
+		return true
+	})
+	return ends
+}
+
+// Referrers returns v's referring instructions, or nil if it has none.
+func Referrers(v ssa.Value) []ssa.Instruction {
+	refs := v.Referrers()
+	if refs == nil {
+		return nil
+	}
+	return *refs
+}
+
 // CalleeInfo returns the package path and name of the call's static callee.
 // ok is false if the callee is not statically known (e.g. an interface method).
-func CalleeInfo(call *ssa.Call) (pkgPath, name string, ok bool) {
-	callee := call.Call.StaticCallee()
+func CalleeInfo(call ssa.CallInstruction) (pkgPath, name string, ok bool) {
+	callee := call.Common().StaticCallee()
 	if callee == nil || callee.Package() == nil {
 		return "", "", false
 	}
@@ -207,7 +268,7 @@ var errUtilWrapFuncs = map[string]bool{"With": true, "Wrap": true, "Witht": true
 
 // isErrUtilCall reports whether call targets an errutil wrapping function, or
 // errutil.New when allowNew is set.
-func isErrUtilCall(call *ssa.Call, allowNew bool) bool {
+func isErrUtilCall(call ssa.CallInstruction, allowNew bool) bool {
 	pkg, name, ok := CalleeInfo(call)
 	if !ok || pkg != ErrUtilPkg {
 		return false
@@ -216,23 +277,24 @@ func isErrUtilCall(call *ssa.Call, allowNew bool) bool {
 }
 
 // IsErrUtilCall returns true if the call is to an errutil wrapping function or errutil.New.
-func IsErrUtilCall(call *ssa.Call) bool { return isErrUtilCall(call, true) }
+func IsErrUtilCall(call ssa.CallInstruction) bool { return isErrUtilCall(call, true) }
 
 // IsErrUtilWrapCall returns true if the call is to errutil.With/Wrap/Witht/Wrapt (not New).
-func IsErrUtilWrapCall(call *ssa.Call) bool { return isErrUtilCall(call, false) }
+func IsErrUtilWrapCall(call ssa.CallInstruction) bool { return isErrUtilCall(call, false) }
 
 // IsErrorConstructor returns true if the call is errors.New or fmt.Errorf.
-func IsErrorConstructor(call *ssa.Call) bool {
+func IsErrorConstructor(call ssa.CallInstruction) bool {
 	pkg, name, ok := CalleeInfo(call)
 	return ok && ((pkg == "errors" && name == "New") || (pkg == "fmt" && name == "Errorf"))
 }
 
 // WrapsErrorConstructor returns true if the errutil.With/Wrap call wraps errors.New or fmt.Errorf.
-func WrapsErrorConstructor(call *ssa.Call) bool {
-	if !IsErrUtilWrapCall(call) || len(call.Call.Args) == 0 {
+func WrapsErrorConstructor(call ssa.CallInstruction) bool {
+	args := call.Common().Args
+	if !IsErrUtilWrapCall(call) || len(args) == 0 {
 		return false
 	}
-	c, ok := UnderlyingCall(call.Call.Args[0])
+	c, ok := UnderlyingCall(args[0])
 	return ok && IsErrorConstructor(c)
 }
 

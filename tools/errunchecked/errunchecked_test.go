@@ -9,6 +9,7 @@ import (
 )
 
 func TestAnalyzer(t *testing.T) {
+	t.Parallel()
 	testdata := analysistest.TestData()
-	analysistest.Run(t, testdata, errunchecked.Analyzer(), "a")
+	analysistest.Run(t, testdata, errunchecked.Analyzer(), "a", "dep", "b")
 }

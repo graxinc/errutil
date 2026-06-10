@@ -3,6 +3,8 @@
 package errwrap
 
 import (
+	"go/token"
+
 	"github.com/graxinc/errutil/tools/internal/shared"
 
 	"golang.org/x/tools/go/analysis"
@@ -29,7 +31,11 @@ func run(pass *analysis.Pass) (any, error) {
 	unwrappedDirectives := shared.CollectDirectives(pass, directiveUnwrapped)
 	newDirectives := shared.CollectDirectives(pass, directiveNew)
 
+	generated := shared.GeneratedFiles(pass)
 	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(fn *ssa.Function) {
+		if shared.IsGeneratedFunc(fn, pass.Fset, generated) {
+			return
+		}
 		checkFunction(pass, fn, unwrappedDirectives, newDirectives)
 	})
 
@@ -39,20 +45,27 @@ func run(pass *analysis.Pass) (any, error) {
 }
 
 func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, newDirectives []*shared.Directive) {
-	errIndices := shared.ErrorResultIndices(fn.Signature)
-	if len(errIndices) == 0 {
-		return
-	}
 	ctx, ok := shared.NewFuncContext(pass, fn)
 	if !ok {
 		return
 	}
+	errIndices := shared.ErrorResultIndices(fn.Signature)
+	var ends map[token.Pos]token.Pos // built lazily; most functions report nothing
+	endOf := func(pos token.Pos) token.Pos {
+		if ends == nil {
+			ends = shared.SubjectEnds(fn)
+		}
+		return ends[pos]
+	}
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			// Check for wrapping error constructors (errors.New, fmt.Errorf)
-			if call, ok := instr.(*ssa.Call); ok && call.Pos().IsValid() {
+			// Check for wrapping error constructors (errors.New, fmt.Errorf).
+			// CallInstruction covers ordinary calls as well as defer and go
+			// statements, whose call wraps a constructor just the same.
+			if call, ok := instr.(ssa.CallInstruction); ok && call.Pos().IsValid() {
 				if shared.WrapsErrorConstructor(call) {
-					ctx.Report(newDirectives, call.Pos(), "use errutil.New instead of wrapping errors.New or fmt.Errorf")
+					ctx.ReportRange(newDirectives, call.Pos(), endOf(call.Pos()),
+						"use errutil.New instead of wrapping errors.New or fmt.Errorf")
 				}
 			}
 
@@ -66,7 +79,8 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, n
 					continue
 				}
 				if !isWrapped(ret.Results[errIdx], make(map[ssa.Value]bool)) {
-					ctx.Report(unwrappedDirectives, ret.Pos(), "error should be wrapped with errutil.With or errutil.Wrap")
+					ctx.ReportRange(unwrappedDirectives, ret.Pos(), endOf(ret.Pos()),
+						"error should be wrapped with errutil.With or errutil.Wrap")
 				}
 			}
 		}
@@ -113,9 +127,53 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 	return false
 }
 
+// deferredStoresWrapped inspects deferred closures in alloc's function that
+// capture alloc and store to it. found is false when no such store exists.
+// Otherwise wrapped reports whether every such store is wrapped. Only defers
+// guaranteed to be registered before the load (their block dominates the load's
+// block) are considered: a conditionally registered defer cannot vouch for
+// every path.
+func deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) (wrapped, found bool) {
+	wrapped = true
+	for _, b := range alloc.Parent().Blocks {
+		for _, instr := range b.Instrs {
+			d, ok := instr.(*ssa.Defer)
+			if !ok || !d.Block().Dominates(loadBlock) {
+				continue
+			}
+			mc, ok := d.Call.Value.(*ssa.MakeClosure)
+			if !ok {
+				continue
+			}
+			closure := mc.Fn.(*ssa.Function)
+			for i, binding := range mc.Bindings {
+				if binding != alloc {
+					continue
+				}
+				for _, ref := range shared.Referrers(closure.FreeVars[i]) {
+					store, ok := ref.(*ssa.Store)
+					if !ok {
+						continue
+					}
+					found = true
+					wrapped = wrapped && isWrapped(store.Val, visited)
+				}
+			}
+		}
+	}
+	return wrapped, found
+}
+
 func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) bool {
 	if alloc.Referrers() == nil {
 		return false
+	}
+	// A deferred closure that stores into alloc (a captured named result) runs
+	// after every return statement, so its stores determine the value callers
+	// observe, overriding any store made before the return — e.g. the idiomatic
+	// `defer func() { err = errutil.With(err) }()`.
+	if wrapped, found := deferredStoresWrapped(alloc, loadBlock, visited); found {
+		return wrapped
 	}
 	// If the load's block contains stores, the last one (in instruction order)
 	// dominates the load, so only its value matters — earlier stores are overwritten.
