@@ -181,7 +181,6 @@ errutil/test/dot.pkg dot.pkg.go:55 StdlibWithStack
 	}
 
 	for n, c := range cases {
-		c := c
 		t.Run(n, func(t *testing.T) {
 			t.Parallel()
 
