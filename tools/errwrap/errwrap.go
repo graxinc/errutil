@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/token"
 
+	"github.com/graxinc/errutil"
 	"github.com/graxinc/errutil/tools/internal/shared"
 
 	"golang.org/x/tools/go/analysis"
@@ -30,7 +31,7 @@ func Analyzer() *analysis.Analyzer {
 func run(pass *analysis.Pass) (any, error) {
 	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	if !ok {
-		return nil, fmt.Errorf("unexpected buildssa result type %T", pass.ResultOf[buildssa.Analyzer])
+		return nil, errutil.New(errutil.Tags{"msg": "unexpected buildssa result type", "type": fmt.Sprintf("%T", pass.ResultOf[buildssa.Analyzer])})
 	}
 	unwrappedDirectives := shared.CollectDirectives(pass, directiveUnwrapped)
 	newDirectives := shared.CollectDirectives(pass, directiveNew)
@@ -66,11 +67,9 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, n
 			// Check for wrapping error constructors (errors.New, fmt.Errorf).
 			// CallInstruction covers ordinary calls as well as defer and go
 			// statements, whose call wraps a constructor just the same.
-			if call, ok := instr.(ssa.CallInstruction); ok && call.Pos().IsValid() {
-				if shared.WrapsErrorConstructor(call) {
-					ctx.ReportRange(newDirectives, call.Pos(), endOf(call.Pos()),
-						"use errutil.New instead of wrapping errors.New or fmt.Errorf")
-				}
+			if call, ok := instr.(ssa.CallInstruction); ok && call.Pos().IsValid() && shared.WrapsErrorConstructor(call) {
+				ctx.ReportRange(newDirectives, call.Pos(), endOf(call.Pos()),
+					"use errutil.New instead of wrapping errors.New or fmt.Errorf")
 			}
 
 			// Check for unwrapped error returns
@@ -131,6 +130,41 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 	return false
 }
 
+func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) bool {
+	if alloc.Referrers() == nil {
+		return false
+	}
+	// A deferred closure that stores into alloc (a captured named result) runs
+	// after every return statement, so its stores determine the value callers
+	// observe, overriding any store made before the return — e.g. the idiomatic
+	// `defer func() { err = errutil.With(err) }()`.
+	if wrapped, found := deferredStoresWrapped(alloc, loadBlock, visited); found {
+		return wrapped
+	}
+	// If the load's block contains stores, the last one (in instruction order)
+	// dominates the load, so only its value matters — earlier stores are overwritten.
+	if loadBlock != nil {
+		var lastStore *ssa.Store
+		for _, instr := range loadBlock.Instrs {
+			if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
+				lastStore = store
+			}
+		}
+		if lastStore != nil {
+			return isWrapped(lastStore.Val, visited)
+		}
+	}
+	// Fallback: check all stores across all blocks.
+	for _, ref := range *alloc.Referrers() {
+		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
+			if !isWrapped(store.Val, visited) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // deferredStoresWrapped inspects deferred closures in alloc's function that
 // capture alloc and store to it. found is false when no such store exists.
 // Otherwise wrapped reports whether every such store is wrapped. Only defers
@@ -169,39 +203,4 @@ func deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited 
 		}
 	}
 	return wrapped, found
-}
-
-func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) bool {
-	if alloc.Referrers() == nil {
-		return false
-	}
-	// A deferred closure that stores into alloc (a captured named result) runs
-	// after every return statement, so its stores determine the value callers
-	// observe, overriding any store made before the return — e.g. the idiomatic
-	// `defer func() { err = errutil.With(err) }()`.
-	if wrapped, found := deferredStoresWrapped(alloc, loadBlock, visited); found {
-		return wrapped
-	}
-	// If the load's block contains stores, the last one (in instruction order)
-	// dominates the load, so only its value matters — earlier stores are overwritten.
-	if loadBlock != nil {
-		var lastStore *ssa.Store
-		for _, instr := range loadBlock.Instrs {
-			if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
-				lastStore = store
-			}
-		}
-		if lastStore != nil {
-			return isWrapped(lastStore.Val, visited)
-		}
-	}
-	// Fallback: check all stores across all blocks.
-	for _, ref := range *alloc.Referrers() {
-		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
-			if !isWrapped(store.Val, visited) {
-				return false
-			}
-		}
-	}
-	return true
 }

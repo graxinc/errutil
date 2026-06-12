@@ -6,6 +6,8 @@ import (
 	"go/token"
 	"go/types"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
@@ -29,16 +31,17 @@ func CollectDirectives(pass *analysis.Pass, prefix string) []*Directive {
 		for _, cg := range f.Comments {
 			filewide := cg.Pos() < f.Package
 			for _, c := range cg.List {
-				if isDirective(c.Text, prefix) {
-					line := pass.Fset.Position(c.Pos()).Line
-					d := &Directive{Pos: c.Pos(), File: pass.Fset.File(c.Pos()), Line: line}
-					if filewide {
-						d.Line = -1
-					} else {
-						d.Owner = ownerFunc(pass, f, cg, line)
-					}
-					directives = append(directives, d)
+				if !isDirective(c.Text, prefix) {
+					continue
 				}
+				line := pass.Fset.Position(c.Pos()).Line
+				d := &Directive{Pos: c.Pos(), File: pass.Fset.File(c.Pos()), Line: line}
+				if filewide {
+					d.Line = -1
+				} else {
+					d.Owner = ownerFunc(pass, f, cg, line)
+				}
+				directives = append(directives, d)
 			}
 		}
 	}
@@ -88,14 +91,13 @@ func isDirective(text, prefix string) bool {
 	// Require a word boundary so "errutil:unwrapped" does not match
 	// "errutil:unwrappedtypo": the prefix must be the whole token, followed by
 	// end-of-comment or a non-identifier character (whitespace, arguments, etc.).
-	return rest == "" || !isIdentChar(rest[0])
+	return rest == "" || !startsIdentChar(rest)
 }
 
-func isIdentChar(b byte) bool {
-	return b == '_' ||
-		'a' <= b && b <= 'z' ||
-		'A' <= b && b <= 'Z' ||
-		'0' <= b && b <= '9'
+// startsIdentChar reports whether s begins with an identifier character.
+func startsIdentChar(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // FuncContext carries the per-function state needed to report suppressible

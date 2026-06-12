@@ -9,6 +9,7 @@ import (
 	"go/types"
 	"slices"
 
+	"github.com/graxinc/errutil"
 	"github.com/graxinc/errutil/tools/internal/shared"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
@@ -30,7 +31,7 @@ func Analyzer() *analysis.Analyzer {
 func run(pass *analysis.Pass) (any, error) {
 	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	if !ok {
-		return nil, fmt.Errorf("unexpected buildssa result type %T", pass.ResultOf[buildssa.Analyzer])
+		return nil, errutil.New(errutil.Tags{"msg": "unexpected buildssa result type", "type": fmt.Sprintf("%T", pass.ResultOf[buildssa.Analyzer])})
 	}
 	directives := shared.CollectDirectives(pass, directivePrefix)
 
@@ -63,6 +64,22 @@ type checker struct {
 	inProgress map[funcResult]bool
 }
 
+// nonNilError is a fact attached to a function whose error result at each listed
+// index is non-nil on every return path. It lets importing packages recognize a
+// callee as never-nil even though its body is not available cross-package.
+type nonNilError struct {
+	Indices []int
+}
+
+func (*nonNilError) AFact() {}
+
+func (f *nonNilError) String() string { return fmt.Sprintf("nonNilError%v", f.Indices) }
+
+type funcResult struct {
+	fn  *ssa.Function
+	idx int
+}
+
 func (c *checker) checkFunction(fn *ssa.Function, directives []*shared.Directive) {
 	ctx, ok := shared.NewFuncContext(c.pass, fn)
 	if !ok {
@@ -74,16 +91,14 @@ func (c *checker) checkFunction(fn *ssa.Function, directives []*shared.Directive
 			// CallInstruction covers ordinary calls as well as defer and go
 			// statements, whose call (and its arguments) is just as unchecked.
 			call, ok := instr.(ssa.CallInstruction)
-			if !ok || !call.Pos().IsValid() {
+			if !ok || !call.Pos().IsValid() || !c.isDirectWrapCall(call) {
 				continue
 			}
-			if c.isDirectWrapCall(call) {
-				if callEnds == nil {
-					callEnds = shared.SubjectEnds(fn)
-				}
-				ctx.ReportRange(directives, call.Pos(), callEnds[call.Pos()],
-					"do not directly wrap function calls; check for nil first")
+			if callEnds == nil {
+				callEnds = shared.SubjectEnds(fn)
 			}
+			ctx.ReportRange(directives, call.Pos(), callEnds[call.Pos()],
+				"do not directly wrap function calls; check for nil first")
 		}
 	}
 }
@@ -123,6 +138,118 @@ func (c *checker) provedNonNil(v ssa.Value, block *ssa.BasicBlock) bool {
 		}
 	}
 	return false
+}
+
+// exportNonNilFact computes and exports a nonNilError fact for fn, if any of its
+// error results are always non-nil.
+func (c *checker) exportNonNilFact(fn *ssa.Function) {
+	obj := fn.Object()
+	// Only exported functions and methods of this package can be referenced (and
+	// have their fact imported) by another package; same-package callees are
+	// proved directly from their body, so a fact for an unexported function
+	// would never be used. Exported() is name-based, which is what we want: an
+	// exported method on an unexported type is still callable cross-package
+	// (e.g. on a value obtained from an exported function).
+	if obj == nil || obj.Pkg() != c.pass.Pkg || !obj.Exported() {
+		return
+	}
+	sig, ok := obj.Type().(*types.Signature)
+	if !ok {
+		return
+	}
+	var indices []int
+	for _, i := range shared.ErrorResultIndices(sig) {
+		if c.funcResultNonNil(fn, i) {
+			indices = append(indices, i)
+		}
+	}
+	if len(indices) > 0 {
+		c.pass.ExportObjectFact(obj, &nonNilError{Indices: indices})
+	}
+}
+
+// valueNonNil reports whether v is a provably non-nil error: an interface
+// construction (which is never nil, even when boxing a nil pointer), a known
+// non-nil constructor, or a call whose callee always returns a non-nil error.
+func (c *checker) valueNonNil(v ssa.Value) bool {
+	if src := conversionSource(v); src != nil {
+		return c.valueNonNil(src)
+	}
+	switch val := v.(type) {
+	case *ssa.MakeInterface:
+		return true
+	case *ssa.Call:
+		if shared.IsErrUtilCall(val) || shared.IsErrorConstructor(val) {
+			return true
+		}
+		return c.calleeResultNonNil(val.Call.StaticCallee(), 0)
+	case *ssa.Extract:
+		if call, ok := val.Tuple.(*ssa.Call); ok {
+			return c.calleeResultNonNil(call.Call.StaticCallee(), val.Index)
+		}
+	}
+	return false
+}
+
+// calleeResultNonNil reports whether callee's result at idx is always a non-nil
+// error. For callees with a body (this package) it inspects the returns; for
+// callees without one (another package) it consults an imported fact.
+func (c *checker) calleeResultNonNil(callee *ssa.Function, idx int) bool {
+	if callee == nil {
+		return false
+	}
+	if len(callee.Blocks) > 0 {
+		return c.funcResultNonNil(callee, idx)
+	}
+	obj := callee.Object()
+	if obj == nil {
+		return false
+	}
+	var fact nonNilError
+	return c.pass.ImportObjectFact(obj, &fact) && slices.Contains(fact.Indices, idx)
+}
+
+// funcResultNonNil reports whether fn's result at idx is non-nil on every return
+// path, memoized across the package. Recursion is treated conservatively (a cycle
+// yields false), as is a function with no body.
+func (c *checker) funcResultNonNil(fn *ssa.Function, idx int) bool {
+	if len(fn.Blocks) == 0 {
+		return false
+	}
+	key := funcResult{fn, idx}
+	if v, ok := c.memo[key]; ok {
+		return v
+	}
+	if c.inProgress[key] {
+		return false
+	}
+	c.inProgress[key] = true
+	res := c.computeResultNonNil(fn, idx)
+	delete(c.inProgress, key)
+	c.memo[key] = res
+	return res
+}
+
+func (c *checker) computeResultNonNil(fn *ssa.Function, idx int) bool {
+	sawReturn := false
+	for _, b := range fn.Blocks {
+		if len(b.Instrs) == 0 {
+			continue
+		}
+		ret, ok := b.Instrs[len(b.Instrs)-1].(*ssa.Return)
+		if !ok {
+			continue
+		}
+		sawReturn = true
+		// A nil-check-guarded return — the `if err != nil { return err }`
+		// shape — counts via provedNonNil, letting a helper vouch for an
+		// unprovable callee's result (e.g. one routed through a replaceable
+		// function variable) by guarding it.
+		if idx >= len(ret.Results) || !c.provedNonNil(ret.Results[idx], b) {
+			return false
+		}
+	}
+	return sawReturn
 }
 
 // isContextErrInDoneBranch reports whether call is ctx.Err() and some block that
@@ -259,134 +386,6 @@ func contextMethodRecv(call *ssa.Call, name string) (recv ssa.Value, ok bool) {
 		return nil, false
 	}
 	return c.Value, true
-}
-
-// nonNilError is a fact attached to a function whose error result at each listed
-// index is non-nil on every return path. It lets importing packages recognize a
-// callee as never-nil even though its body is not available cross-package.
-type nonNilError struct {
-	Indices []int
-}
-
-func (*nonNilError) AFact() {}
-
-func (f *nonNilError) String() string { return fmt.Sprintf("nonNilError%v", f.Indices) }
-
-type funcResult struct {
-	fn  *ssa.Function
-	idx int
-}
-
-// exportNonNilFact computes and exports a nonNilError fact for fn, if any of its
-// error results are always non-nil.
-func (c *checker) exportNonNilFact(fn *ssa.Function) {
-	obj := fn.Object()
-	// Only exported functions and methods of this package can be referenced (and
-	// have their fact imported) by another package; same-package callees are
-	// proved directly from their body, so a fact for an unexported function
-	// would never be used. Exported() is name-based, which is what we want: an
-	// exported method on an unexported type is still callable cross-package
-	// (e.g. on a value obtained from an exported function).
-	if obj == nil || obj.Pkg() != c.pass.Pkg || !obj.Exported() {
-		return
-	}
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return
-	}
-	var indices []int
-	for _, i := range shared.ErrorResultIndices(sig) {
-		if c.funcResultNonNil(fn, i) {
-			indices = append(indices, i)
-		}
-	}
-	if len(indices) > 0 {
-		c.pass.ExportObjectFact(obj, &nonNilError{Indices: indices})
-	}
-}
-
-// valueNonNil reports whether v is a provably non-nil error: an interface
-// construction (which is never nil, even when boxing a nil pointer), a known
-// non-nil constructor, or a call whose callee always returns a non-nil error.
-func (c *checker) valueNonNil(v ssa.Value) bool {
-	if src := conversionSource(v); src != nil {
-		return c.valueNonNil(src)
-	}
-	switch val := v.(type) {
-	case *ssa.MakeInterface:
-		return true
-	case *ssa.Call:
-		if shared.IsErrUtilCall(val) || shared.IsErrorConstructor(val) {
-			return true
-		}
-		return c.calleeResultNonNil(val.Call.StaticCallee(), 0)
-	case *ssa.Extract:
-		if call, ok := val.Tuple.(*ssa.Call); ok {
-			return c.calleeResultNonNil(call.Call.StaticCallee(), val.Index)
-		}
-	}
-	return false
-}
-
-// calleeResultNonNil reports whether callee's result at idx is always a non-nil
-// error. For callees with a body (this package) it inspects the returns; for
-// callees without one (another package) it consults an imported fact.
-func (c *checker) calleeResultNonNil(callee *ssa.Function, idx int) bool {
-	if callee == nil {
-		return false
-	}
-	if len(callee.Blocks) > 0 {
-		return c.funcResultNonNil(callee, idx)
-	}
-	obj := callee.Object()
-	if obj == nil {
-		return false
-	}
-	var fact nonNilError
-	return c.pass.ImportObjectFact(obj, &fact) && slices.Contains(fact.Indices, idx)
-}
-
-// funcResultNonNil reports whether fn's result at idx is non-nil on every return
-// path, memoized across the package. Recursion is treated conservatively (a cycle
-// yields false), as is a function with no body.
-func (c *checker) funcResultNonNil(fn *ssa.Function, idx int) bool {
-	if len(fn.Blocks) == 0 {
-		return false
-	}
-	key := funcResult{fn, idx}
-	if v, ok := c.memo[key]; ok {
-		return v
-	}
-	if c.inProgress[key] {
-		return false
-	}
-	c.inProgress[key] = true
-	res := c.computeResultNonNil(fn, idx)
-	delete(c.inProgress, key)
-	c.memo[key] = res
-	return res
-}
-
-func (c *checker) computeResultNonNil(fn *ssa.Function, idx int) bool {
-	sawReturn := false
-	for _, b := range fn.Blocks {
-		if len(b.Instrs) == 0 {
-			continue
-		}
-		ret, ok := b.Instrs[len(b.Instrs)-1].(*ssa.Return)
-		if !ok {
-			continue
-		}
-		sawReturn = true
-		// A nil-check-guarded return — the `if err != nil { return err }`
-		// shape — counts via provedNonNil, letting a helper vouch for an
-		// unprovable callee's result (e.g. one routed through a replaceable
-		// function variable) by guarding it.
-		if idx >= len(ret.Results) || !c.provedNonNil(ret.Results[idx], b) {
-			return false
-		}
-	}
-	return sawReturn
 }
 
 // conversionSource returns the source value of a nil-ness-preserving interface
