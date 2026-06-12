@@ -252,12 +252,17 @@ func UnderlyingCall(v ssa.Value) (call *ssa.Call, ok bool) {
 
 var errType = types.Universe.Lookup("error").Type()
 
+// IsErrorType reports whether t is the error interface type.
+func IsErrorType(t types.Type) bool {
+	return types.Identical(t, errType)
+}
+
 // ErrorResultIndices returns the indices of all error results in the signature.
 func ErrorResultIndices(sig *types.Signature) []int {
 	results := sig.Results() // nil-safe: (*types.Tuple).Len reports 0 for a nil tuple.
 	var indices []int
 	for i := range results.Len() {
-		if types.Identical(results.At(i).Type(), errType) {
+		if IsErrorType(results.At(i).Type()) {
 			indices = append(indices, i)
 		}
 	}

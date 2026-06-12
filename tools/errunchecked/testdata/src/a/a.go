@@ -837,3 +837,339 @@ func goodCtxFieldReassignLimitation(ctx1, ctx2 context.Context) error {
 	h.ctx = ctx2
 	return errutil.With(h.ctx.Err())
 }
+
+// isFooErr returns true only for non-nil errors: the nil case returns false
+// before any inspection, so its true branch works as a nil check.
+func isFooErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err.Error() == "foo"
+}
+
+// Good: a predicate helper's true branch establishes non-nil.
+func goodPredicateHelper() error {
+	err := returnsErr()
+	if isFooErr(err) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// Good: the predicate proves through && short-circuit conditions too.
+func goodPredicateHelperAnd(other bool) error {
+	err := returnsErr()
+	if other && isFooErr(err) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// truthy can return true for a nil error, so it proves nothing.
+func truthy(error) bool {
+	return true
+}
+
+// Bad: a predicate without a nil guard does not establish non-nil.
+func badPredicateNoGuard() error {
+	err := returnsErr()
+	if truthy(err) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// mergedPredicate returns a value merged from guarded and unguarded paths (an
+// SSA phi); the value-level proof accepts it: the unguarded incoming is
+// constant false, and the guarded incoming arrives from the err != nil branch.
+func mergedPredicate(err error, other bool) bool {
+	return err != nil && other
+}
+
+// Good: the merged-value predicate establishes non-nil.
+func goodMergedPredicate() error {
+	err := returnsErr()
+	if mergedPredicate(err, true) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// reversedMergedPredicate puts the nil check in the merged value itself rather
+// than the guarding branch.
+func reversedMergedPredicate(err error, other bool) bool {
+	return other && err != nil
+}
+
+// Good: the reversed merged-value predicate establishes non-nil too.
+func goodReversedMergedPredicate() error {
+	err := returnsErr()
+	if reversedMergedPredicate(err, true) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// isNamedErr mirrors the comma-ok-and-condition helper shape: true requires
+// ok, and ok (an errors.AsType match) implies a non-nil err — no explicit nil
+// guard needed.
+func isNamedErr(err error, name string) bool {
+	cErr, ok := errors.AsType[*customErr](err)
+	return ok && cErr.Error() == name
+}
+
+// Good: the comma-ok-and-condition predicate establishes non-nil.
+func goodCommaOkPredicate() error {
+	err := returnsErr()
+	if isNamedErr(err, "x") {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// orPredicate can return true for a nil error (when other is true), so it
+// proves nothing.
+func orPredicate(err error, other bool) bool {
+	return err != nil || other
+}
+
+// Bad: the || merge does not establish non-nil.
+func badOrPredicate() error {
+	err := returnsErr()
+	if orPredicate(err, true) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// negatedPredicate proves through negation of a recognized condition.
+func negatedPredicate(err error) bool {
+	return !(err == nil)
+}
+
+// Good: the negated predicate establishes non-nil.
+func goodNegatedPredicate() error {
+	err := returnsErr()
+	if negatedPredicate(err) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// isSentinelErr forwards to errors.Is with a never-nil package sentinel: the
+// target is provably non-nil, so the predicate is recognized without an
+// explicit nil guard.
+func isSentinelErr(err error) bool {
+	return errors.Is(err, sentinel)
+}
+
+// Good: the sentinel-target predicate establishes non-nil.
+func goodSentinelTargetPredicate() error {
+	err := returnsErr()
+	if isSentinelErr(err) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// isSentinelEqual compares against the proven sentinel: equality with a
+// provably non-nil value needs no branch-position trust.
+func isSentinelEqual(err error) bool {
+	return err == sentinel
+}
+
+// Good: equality against a proven sentinel establishes non-nil.
+func goodSentinelEqualPredicate() error {
+	err := returnsErr()
+	if isSentinelEqual(err) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// isForwardedTarget forwards its own parameter as the errors.Is target;
+// isForwardedTarget(nil, nil) is true, so it proves nothing.
+func isForwardedTarget(err, target error) bool {
+	return errors.Is(err, target)
+}
+
+// Bad: the forwarded-target predicate is not recognized.
+func badForwardedTargetPredicate() error {
+	err := returnsErr()
+	if isForwardedTarget(err, nil) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// errMutable is assigned nil outside initialization, so it is not a sentinel.
+var errMutable = errors.New("mutable")
+
+func resetMutable() {
+	errMutable = nil
+}
+
+func isMutableErr(err error) bool {
+	return errors.Is(err, errMutable)
+}
+
+// Bad: a target var with a nil store somewhere is not a sentinel.
+func badMutableTargetPredicate() error {
+	err := returnsErr()
+	resetMutable()
+	if isMutableErr(err) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// errEscapes has its address passed away, so its stores cannot be tracked.
+var errEscapes = errors.New("escapes")
+
+func escapeVar(p *error) {
+	_ = p
+}
+
+func init() {
+	escapeVar(&errEscapes)
+}
+
+func isEscapedErr(err error) bool {
+	return errors.Is(err, errEscapes)
+}
+
+// Bad: an address-escaping target var is not a sentinel.
+func badEscapedTargetPredicate() error {
+	err := returnsErr()
+	if isEscapedErr(err) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// sentinelEqualPredicate returns equality against a possibly-nil parameter.
+// Sentinel equality is only trusted in branch position, never as a returned
+// value — errors.Is's own body ends in this shape and must not get a fact.
+func sentinelEqualPredicate(err, target error) bool {
+	return err == target
+}
+
+// Bad: returned sentinel equality proves nothing (true for nil == nil).
+func badSentinelEqualPredicate() error {
+	err := returnsErr()
+	if sentinelEqualPredicate(err, nil) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// loopPredicate accumulates its result through a loop phi cycle, proved
+// inductively over iterations: res starts false and can only become true via
+// err != nil, with the res-was-already-true edge covered by the induction
+// hypothesis.
+func loopPredicate(err error, n int) bool {
+	res := false
+	for i := 0; i < n; i++ {
+		res = res || err != nil
+	}
+	return res
+}
+
+// Good: the loop-accumulator predicate establishes non-nil.
+func goodLoopPredicate() error {
+	err := returnsErr()
+	if loopPredicate(err, 3) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// loopUnrelated can become true from a value unrelated to err, so the
+// induction has no sound base case.
+func loopUnrelated(err error, other bool, n int) bool {
+	res := false
+	for i := 0; i < n; i++ {
+		res = res || other
+	}
+	_ = err
+	return res
+}
+
+// Bad: a loop accumulating an unrelated condition proves nothing.
+func badLoopUnrelatedPredicate() error {
+	err := returnsErr()
+	if loopUnrelated(err, true, 3) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// loopFlip negates its accumulator each iteration, so the induction
+// hypothesis (stated for true) cannot discharge the flipped edge.
+func loopFlip(err error, n int) bool {
+	res := err != nil
+	for i := 0; i < n; i++ {
+		res = !res
+	}
+	return res
+}
+
+// Bad: a flipping accumulator can be true on iterations where err is nil.
+func badLoopFlipPredicate() error {
+	err := returnsErr()
+	if loopFlip(err, 3) {
+		return errutil.With(err) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// fooChecker.Is shows predicate methods work; the receiver shifts the error to
+// ssa argument 1. Its exported name also gets a fact (Exported is name-based).
+type fooChecker struct{}
+
+func (fooChecker) Is(err error) bool { // want Is:`nonNilWhenTrue\[1\]`
+	if err == nil {
+		return false
+	}
+	return true
+}
+
+// Good: predicate methods establish non-nil like predicate functions.
+func goodPredicateMethod() error {
+	err := returnsErr()
+	var f fooChecker
+	if f.Is(err) {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// Bad: the predicate guards a different error than the wrapped one.
+func badPredicateDifferentErr() error {
+	err1 := returnsErr()
+	err2 := returnsErr()
+	if isFooErr(err1) {
+		return errutil.With(err2) // want `do not directly wrap`
+	}
+	return nil
+}
+
+// Good: errors.AsType's ok is the generic equivalent of errors.As — a nil
+// error matches no target type.
+func goodErrorsAsTypeCheck() error {
+	err := returnsErr()
+	if _, ok := errors.AsType[*customErr](err); ok {
+		return errutil.With(err)
+	}
+	return nil
+}
+
+// Bad: the AsType ok guards a different error than the wrapped one.
+func badErrorsAsTypeDifferentErr() error {
+	err1 := returnsErr()
+	err2 := returnsErr()
+	if _, ok := errors.AsType[*customErr](err1); ok {
+		return errutil.With(err2) // want `do not directly wrap`
+	}
+	return nil
+}
