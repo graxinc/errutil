@@ -23,7 +23,7 @@ func Analyzer() *analysis.Analyzer {
 		Name:      "errunchecked",
 		Doc:       "check that errutil.With/Wrap is not called directly on function results without nil check",
 		Requires:  []*analysis.Analyzer{buildssa.Analyzer},
-		FactTypes: []analysis.Fact{(*nonNilError)(nil)},
+		FactTypes: []analysis.Fact{(*nonNilError)(nil), (*nonNilWhenTrue)(nil), (*nonNilVar)(nil)},
 		Run:       run,
 	}
 }
@@ -35,14 +35,24 @@ func run(pass *analysis.Pass) (any, error) {
 	}
 	directives := shared.CollectDirectives(pass, directivePrefix)
 
-	c := &checker{pass: pass, memo: map[funcResult]bool{}, inProgress: map[funcResult]bool{}}
+	c := &checker{
+		pass:           pass,
+		ssaPkg:         ssaInfo.Pkg,
+		srcFuncs:       ssaInfo.SrcFuncs,
+		memo:           map[funcResult]bool{},
+		inProgress:     map[funcResult]bool{},
+		predMemo:       map[funcResult]bool{},
+		predInProgress: map[funcResult]bool{},
+	}
 
-	// Export "always returns non-nil error" facts for this package's functions so
-	// that importing packages can recognize them (cross-package callees have no SSA
-	// body to inspect). This also warms the memo for the check phase below.
-	// Generated functions still export facts — they can vouch for handwritten
-	// callers — but are not checked below.
-	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, c.exportNonNilFact)
+	// Export facts for this package's functions so that importing packages can
+	// recognize them (cross-package callees have no SSA body to inspect):
+	// "always returns non-nil error" and "returns true only when its error
+	// parameter is non-nil". This also warms the memos for the check phase
+	// below. Generated functions still export facts — they can vouch for
+	// handwritten callers — but are not checked below.
+	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, c.exportFacts)
+	c.exportVarFacts()
 
 	generated := shared.GeneratedFiles(pass)
 	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(fn *ssa.Function) {
@@ -56,12 +66,21 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// checker holds per-package state for the analysis: the pass, plus a memo and
-// in-progress set for the (potentially recursive) non-nil-return computation.
+// checker holds per-package state for the analysis: the pass and its SSA, plus
+// memos and in-progress sets for the (potentially recursive) non-nil-return
+// and true-implies-non-nil computations, and the lazily built never-nil
+// sentinel var verdicts.
 type checker struct {
-	pass       *analysis.Pass
-	memo       map[funcResult]bool
-	inProgress map[funcResult]bool
+	pass           *analysis.Pass
+	ssaPkg         *ssa.Package
+	srcFuncs       []*ssa.Function
+	memo           map[funcResult]bool
+	inProgress     map[funcResult]bool
+	predMemo       map[funcResult]bool
+	predInProgress map[funcResult]bool
+
+	sentinels         map[*ssa.Global]bool // nil until built by localSentinels
+	sentinelsBuilding bool
 }
 
 // nonNilError is a fact attached to a function whose error result at each listed
@@ -74,6 +93,30 @@ type nonNilError struct {
 func (*nonNilError) AFact() {}
 
 func (f *nonNilError) String() string { return fmt.Sprintf("nonNilError%v", f.Indices) }
+
+// nonNilWhenTrue is a fact attached to a bool-returning function that returns
+// true only when its error parameter at each listed index is non-nil. It lets
+// importing packages treat a dominating `if helper(err)` true branch as a nil
+// check on err. Indices are in ssa argument order, so a method's receiver is
+// index 0.
+type nonNilWhenTrue struct {
+	Params []int
+}
+
+func (*nonNilWhenTrue) AFact() {}
+
+func (f *nonNilWhenTrue) String() string { return fmt.Sprintf("nonNilWhenTrue%v", f.Params) }
+
+// nonNilVar is a fact attached to a package-level error var that is a never-nil
+// sentinel: assigned at initialization, every store provably non-nil, and its
+// address never escaping its package. An importer may still legally reassign
+// an exported var, which the home package cannot see; sentinel reassignment is
+// treated as adversarial and ignored.
+type nonNilVar struct{}
+
+func (*nonNilVar) AFact() {}
+
+func (*nonNilVar) String() string { return "nonNilVar" }
 
 type funcResult struct {
 	fn  *ssa.Function
@@ -133,16 +176,17 @@ func (c *checker) isDirectWrapCall(call ssa.CallInstruction) bool {
 // conversions are looked through: a proof on any value in the chain suffices.
 func (c *checker) provedNonNil(v ssa.Value, block *ssa.BasicBlock) bool {
 	for ; v != nil; v = conversionSource(v) {
-		if c.valueNonNil(v) || isNilChecked(v, block) {
+		if c.valueNonNil(v) || c.isNilChecked(v, block, true) {
 			return true
 		}
 	}
 	return false
 }
 
-// exportNonNilFact computes and exports a nonNilError fact for fn, if any of its
-// error results are always non-nil.
-func (c *checker) exportNonNilFact(fn *ssa.Function) {
+// exportFacts computes and exports facts for fn: nonNilError for error results
+// that are always non-nil, and nonNilWhenTrue for bool predicates whose true
+// result implies an error parameter is non-nil.
+func (c *checker) exportFacts(fn *ssa.Function) {
 	obj := fn.Object()
 	// Only exported functions and methods of this package can be referenced (and
 	// have their fact imported) by another package; same-package callees are
@@ -157,6 +201,7 @@ func (c *checker) exportNonNilFact(fn *ssa.Function) {
 	if !ok {
 		return
 	}
+
 	var indices []int
 	for _, i := range shared.ErrorResultIndices(sig) {
 		if c.funcResultNonNil(fn, i) {
@@ -166,11 +211,34 @@ func (c *checker) exportNonNilFact(fn *ssa.Function) {
 	if len(indices) > 0 {
 		c.pass.ExportObjectFact(obj, &nonNilError{Indices: indices})
 	}
+
+	var params []int
+	for i := range fn.Params {
+		if c.trueImpliesNonNil(fn, i) {
+			params = append(params, i)
+		}
+	}
+	if len(params) > 0 {
+		c.pass.ExportObjectFact(obj, &nonNilWhenTrue{Params: params})
+	}
+}
+
+// exportVarFacts exports a nonNilVar fact for each of this package's exported
+// never-nil sentinel vars, so importing packages can prove against them.
+func (c *checker) exportVarFacts() {
+	for g, nonNil := range c.localSentinels() {
+		obj := g.Object()
+		if !nonNil || obj == nil || obj.Pkg() != c.pass.Pkg || !obj.Exported() {
+			continue
+		}
+		c.pass.ExportObjectFact(obj, &nonNilVar{})
+	}
 }
 
 // valueNonNil reports whether v is a provably non-nil error: an interface
 // construction (which is never nil, even when boxing a nil pointer), a known
-// non-nil constructor, or a call whose callee always returns a non-nil error.
+// non-nil constructor, a call whose callee always returns a non-nil error, or
+// a load of a never-nil sentinel var.
 func (c *checker) valueNonNil(v ssa.Value) bool {
 	if src := conversionSource(v); src != nil {
 		return c.valueNonNil(src)
@@ -187,8 +255,105 @@ func (c *checker) valueNonNil(v ssa.Value) bool {
 		if call, ok := val.Tuple.(*ssa.Call); ok {
 			return c.calleeResultNonNil(call.Call.StaticCallee(), val.Index)
 		}
+	case *ssa.UnOp:
+		if val.Op == token.MUL {
+			if g, ok := val.X.(*ssa.Global); ok {
+				return c.globalNonNil(g)
+			}
+		}
 	}
 	return false
+}
+
+// globalNonNil reports whether g is a never-nil sentinel var. For this
+// package's globals it scans the package; for imported ones it consults a
+// nonNilVar fact.
+func (c *checker) globalNonNil(g *ssa.Global) bool {
+	if g.Pkg == c.ssaPkg {
+		return c.localSentinels()[g]
+	}
+	obj := g.Object()
+	if obj == nil {
+		return false
+	}
+	var fact nonNilVar
+	return c.pass.ImportObjectFact(obj, &fact)
+}
+
+// localSentinels computes never-nil verdicts for this package's error vars,
+// once: a single pass classifies every appearance of a global as a load
+// (benign), a store (the value must prove non-nil), or anything else (the
+// address escapes and stores can no longer be tracked). A sentinel must also
+// be stored in the package initializer, or it would be nil before its first
+// assignment. While building, re-entrant queries (a store whose value depends
+// on another global) resolve to false, conservatively but deterministically.
+func (c *checker) localSentinels() map[*ssa.Global]bool {
+	if c.sentinels != nil || c.sentinelsBuilding {
+		return c.sentinels
+	}
+	c.sentinelsBuilding = true
+	defer func() { c.sentinelsBuilding = false }()
+
+	stores := map[*ssa.Global][]ssa.Value{}
+	initStored := map[*ssa.Global]bool{}
+	escaped := map[*ssa.Global]bool{}
+	initFn := c.ssaPkg.Func("init")
+	shared.WalkFunctions(c.ssaPkg, c.srcFuncs, func(fn *ssa.Function) {
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				switch in := instr.(type) {
+				case *ssa.UnOp:
+					if in.Op == token.MUL {
+						if _, ok := in.X.(*ssa.Global); ok {
+							continue // a plain load
+						}
+					}
+				case *ssa.Store:
+					if g, ok := in.Addr.(*ssa.Global); ok {
+						stores[g] = append(stores[g], in.Val)
+						if fn == initFn {
+							initStored[g] = true
+						}
+						// The stored value may itself be a global's address.
+						if vg, ok := in.Val.(*ssa.Global); ok {
+							escaped[vg] = true
+						}
+						continue
+					}
+				}
+				for _, op := range instr.Operands(nil) {
+					if g, ok := (*op).(*ssa.Global); ok {
+						escaped[g] = true
+					}
+				}
+			}
+		}
+	})
+
+	verdicts := map[*ssa.Global]bool{}
+	for _, mem := range c.ssaPkg.Members {
+		g, ok := mem.(*ssa.Global)
+		if !ok || !isErrorVar(g) || escaped[g] || !initStored[g] {
+			continue
+		}
+		nonNil := true
+		for _, val := range stores[g] {
+			if !c.valueNonNil(val) {
+				nonNil = false
+				break
+			}
+		}
+		verdicts[g] = nonNil
+	}
+	c.sentinels = verdicts
+	return c.sentinels
+}
+
+// isErrorVar reports whether g is a package-level error variable (a Global's
+// type is a pointer to the var's type).
+func isErrorVar(g *ssa.Global) bool {
+	ptr, ok := g.Type().(*types.Pointer)
+	return ok && shared.IsErrorType(ptr.Elem())
 }
 
 // calleeResultNonNil reports whether callee's result at idx is always a non-nil
@@ -216,17 +381,25 @@ func (c *checker) funcResultNonNil(fn *ssa.Function, idx int) bool {
 	if len(fn.Blocks) == 0 {
 		return false
 	}
-	key := funcResult{fn, idx}
-	if v, ok := c.memo[key]; ok {
+	return memoized(c.memo, c.inProgress, funcResult{fn, idx}, func() bool {
+		return c.computeResultNonNil(fn, idx)
+	})
+}
+
+// memoized returns the cached result for key, running compute on a miss.
+// Recursion is treated conservatively: a key already being computed yields
+// false without caching, so the final verdict is still computed and stored.
+func memoized(memo, inProgress map[funcResult]bool, key funcResult, compute func() bool) bool {
+	if v, ok := memo[key]; ok {
 		return v
 	}
-	if c.inProgress[key] {
+	if inProgress[key] {
 		return false
 	}
-	c.inProgress[key] = true
-	res := c.computeResultNonNil(fn, idx)
-	delete(c.inProgress, key)
-	c.memo[key] = res
+	inProgress[key] = true
+	res := compute()
+	delete(inProgress, key)
+	memo[key] = res
 	return res
 }
 
@@ -250,6 +423,179 @@ func (c *checker) computeResultNonNil(fn *ssa.Function, idx int) bool {
 		}
 	}
 	return sawReturn
+}
+
+// trueImpliesNonNil reports whether fn returning true implies its parameter at
+// idx (an error) was non-nil — the `isFooErr(err)` predicate-helper shape —
+// memoized across the package. Recursion is treated conservatively (a cycle
+// yields false), as is a function with no body. idx is in ssa parameter order,
+// so a method's receiver is index 0.
+func (c *checker) trueImpliesNonNil(fn *ssa.Function, idx int) bool {
+	if len(fn.Blocks) == 0 || !isBoolPredicate(fn) ||
+		idx >= len(fn.Params) || !shared.IsErrorType(fn.Params[idx].Type()) {
+		return false
+	}
+	return memoized(c.predMemo, c.predInProgress, funcResult{fn, idx}, func() bool {
+		return c.computeTrueImpliesNonNil(fn, idx)
+	})
+}
+
+// computeTrueImpliesNonNil proves the implication per return: a return is safe
+// when it is dominated by a check establishing the parameter non-nil (any true
+// it returns is covered by the check), or when the returned value itself can
+// only be true with the parameter non-nil (valueImpliesNonNil, covering merged
+// conditions like `return err != nil && ok`).
+func (c *checker) computeTrueImpliesNonNil(fn *ssa.Function, idx int) bool {
+	param := fn.Params[idx]
+	sawReturn := false
+	for _, b := range fn.Blocks {
+		if len(b.Instrs) == 0 {
+			continue
+		}
+		ret, ok := b.Instrs[len(b.Instrs)-1].(*ssa.Return)
+		if !ok {
+			continue
+		}
+		sawReturn = true
+		if len(ret.Results) != 1 {
+			return false
+		}
+		if c.isNilChecked(param, b, false) {
+			continue
+		}
+		if !c.valueImpliesNonNil(ret.Results[0], param, true, map[*ssa.Phi]bool{}) {
+			return false
+		}
+	}
+	return sawReturn
+}
+
+// valueImpliesNonNil reports whether v evaluating to want implies param was
+// non-nil — the value-level counterpart of condEstablishesNonNil, for
+// predicates whose result is a merged condition rather than a branch to
+// distinct returns. A bool constant satisfies any judgment its value cannot
+// trigger; a recognized condition shape satisfies its polarity; negation
+// flips want; and a phi holds when every incoming value either satisfies the
+// judgment or arrives only while param was known non-nil — via a dominating
+// check on the predecessor, or via the edge itself when the predecessor
+// branches directly into the merge (the short-circuit shape: in
+// `return err != nil && ok` the unguarded incoming is constant false, and the
+// guarded one arrives from the non-nil branch).
+//
+// Phi cycles are handled inductively over loop iterations: while a phi's
+// obligations are being checked it is assumed to satisfy them (assumed maps
+// the phi to its want), so a loop accumulator like `res = res || err != nil`
+// discharges its res-was-already-true edge by the induction hypothesis. The
+// hypothesis stands only if every base edge proves out; any failure discards
+// the whole proof.
+func (c *checker) valueImpliesNonNil(v ssa.Value, param ssa.Value, want bool, assumed map[*ssa.Phi]bool) bool {
+	if cnst, ok := v.(*ssa.Const); ok {
+		return isBoolConst(cnst, !want)
+	}
+	if onTrue, ok := c.condImpliesNonNil(v, param, false); ok && onTrue == want {
+		return true
+	}
+	// condImpliesNonNil only negates recognized conditions; recursing here
+	// also covers negation over phis and constants.
+	if un, ok := v.(*ssa.UnOp); ok && un.Op == token.NOT {
+		return c.valueImpliesNonNil(un.X, param, !want, assumed)
+	}
+	phi, ok := v.(*ssa.Phi)
+	if !ok {
+		return false
+	}
+	if w, ok := assumed[phi]; ok {
+		return w == want // the induction hypothesis; a flipped want proves nothing
+	}
+	assumed[phi] = want
+	defer delete(assumed, phi)
+	for i, edge := range phi.Edges {
+		pred := phi.Block().Preds[i]
+		if c.isNilChecked(param, pred, false) || c.edgeEstablishes(pred, phi.Block(), param, assumed) {
+			continue
+		}
+		if !c.valueImpliesNonNil(edge, param, want, assumed) {
+			return false
+		}
+	}
+	return true
+}
+
+// edgeEstablishes reports whether traversing the CFG edge pred→succ implies
+// param was non-nil: pred must end in an If with exactly one successor equal
+// to succ, fixing the condition's truth value on the edge, and that truth
+// value must imply non-nil — directly, or through the induction hypothesis of
+// an assumed phi. This is the φ-incoming-edge counterpart of establishes,
+// which needs a dominated block and cannot see facts that exist only on the
+// edge into a merge (the short-circuit and loop-accumulator shapes).
+func (c *checker) edgeEstablishes(pred, succ *ssa.BasicBlock, param ssa.Value, assumed map[*ssa.Phi]bool) bool {
+	if len(pred.Instrs) == 0 {
+		return false
+	}
+	ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
+	if !ok || pred.Succs[0] == pred.Succs[1] {
+		return false
+	}
+	var condIs bool // the condition's value on this edge
+	switch succ {
+	case pred.Succs[0]:
+		condIs = true
+	case pred.Succs[1]:
+		condIs = false
+	default:
+		return false
+	}
+	cond := ifInstr.Cond
+	for {
+		un, ok := cond.(*ssa.UnOp)
+		if !ok || un.Op != token.NOT {
+			break
+		}
+		cond, condIs = un.X, !condIs
+	}
+	if onTrue, ok := c.condImpliesNonNil(cond, param, false); ok && onTrue == condIs {
+		return true
+	}
+	if phi, ok := cond.(*ssa.Phi); ok {
+		if w, ok := assumed[phi]; ok && w == condIs {
+			return true
+		}
+	}
+	return false
+}
+
+// calleeTrueImpliesNonNil reports whether callee returning true implies its
+// parameter at idx was non-nil. For callees with a body (this package) it
+// inspects the returns; for callees without one (another package) it consults
+// an imported fact.
+func (c *checker) calleeTrueImpliesNonNil(callee *ssa.Function, idx int) bool {
+	if callee == nil {
+		return false
+	}
+	if len(callee.Blocks) > 0 {
+		return c.trueImpliesNonNil(callee, idx)
+	}
+	obj := callee.Object()
+	if obj == nil {
+		return false
+	}
+	var fact nonNilWhenTrue
+	return c.pass.ImportObjectFact(obj, &fact) && slices.Contains(fact.Params, idx)
+}
+
+// isBoolPredicate reports whether fn has exactly one result, of boolean type.
+func isBoolPredicate(fn *ssa.Function) bool {
+	results := fn.Signature.Results()
+	if results.Len() != 1 {
+		return false
+	}
+	basic, ok := results.At(0).Type().Underlying().(*types.Basic)
+	return ok && basic.Info()&types.IsBoolean != 0
+}
+
+func isBoolConst(v ssa.Value, b bool) bool {
+	c, ok := v.(*ssa.Const)
+	return ok && c.Value != nil && c.Value.Kind() == constant.Bool && constant.BoolVal(c.Value) == b
 }
 
 // isContextErrInDoneBranch reports whether call is ctx.Err() and some block that
@@ -431,9 +777,10 @@ func nilCheckEquivalent(a, b ssa.Value) bool {
 
 // isNilChecked reports whether v is guaranteed non-nil at block. This holds when
 // a conditional that establishes v's nil-ness (a v != nil / v == nil test, an
-// equality against a sentinel, errors.Is/As on v, or a comma-ok type assertion
-// on v) guards block via establishes.
-func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
+// equality against a sentinel, errors.Is/As/AsType on v, a predicate helper
+// whose true result implies v is non-nil, or a comma-ok type assertion on v)
+// guards block via establishes. trustSentinels is described on condImpliesNonNil.
+func (c *checker) isNilChecked(v ssa.Value, block *ssa.BasicBlock, trustSentinels bool) bool {
 	for _, b := range block.Parent().Blocks {
 		if len(b.Instrs) == 0 {
 			continue
@@ -442,52 +789,113 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 		if !ok {
 			continue
 		}
-		trueBlock, falseBlock := b.Succs[0], b.Succs[1]
-
-		switch cond := ifInstr.Cond.(type) {
-		case *ssa.Call:
-			if isErrorsIsOrAs(cond, v) && establishes(trueBlock, block) {
-				return true
-			}
-		case *ssa.Extract:
-			// The ok of a comma-ok type assertion on v: a nil interface never
-			// asserts successfully to any type, so ok being true implies v is
-			// non-nil. This also covers the if-chain a type switch lowers to
-			// (its `case nil` arm lowers to a nil comparison, handled below).
-			ta, isAssert := cond.Tuple.(*ssa.TypeAssert)
-			if isAssert && cond.Index == 1 && ta.CommaOk && nilCheckEquivalent(ta.X, v) && establishes(trueBlock, block) {
-				return true
-			}
-		case *ssa.BinOp:
-			if cond.Op != token.EQL && cond.Op != token.NEQ {
-				continue
-			}
-			var other ssa.Value
-			switch {
-			case nilCheckEquivalent(cond.X, v):
-				other = cond.Y
-			case nilCheckEquivalent(cond.Y, v):
-				other = cond.X
-			default:
-				continue
-			}
-			equalBlock, notEqualBlock := trueBlock, falseBlock
-			if cond.Op == token.NEQ {
-				equalBlock, notEqualBlock = falseBlock, trueBlock
-			}
-			// v != nil establishes non-nil on the not-equal branch. v == sentinel
-			// establishes it on the equal branch (a nil sentinel is treated as a
-			// deliberate check too; that case is rare and indistinguishable statically).
-			nonNilBlock := equalBlock
-			if isNilConst(other) {
-				nonNilBlock = notEqualBlock
-			}
-			if establishes(nonNilBlock, block) {
-				return true
-			}
+		if c.condEstablishesNonNil(ifInstr.Cond, v, b.Succs[0], b.Succs[1], block, trustSentinels) {
+			return true
 		}
 	}
 	return false
+}
+
+// condEstablishesNonNil reports whether the branch condition cond, with the
+// given true/false successors, establishes that v is non-nil at block.
+func (c *checker) condEstablishesNonNil(cond, v ssa.Value, trueBlock, falseBlock, block *ssa.BasicBlock, trustSentinels bool) bool {
+	onTrue, ok := c.condImpliesNonNil(cond, v, trustSentinels)
+	if !ok {
+		return false
+	}
+	branch := trueBlock
+	if !onTrue {
+		branch = falseBlock
+	}
+	return establishes(branch, block)
+}
+
+// condImpliesNonNil reports whether cond is a recognized nil-ness condition on
+// v, and if so which truth value of cond implies v is non-nil: onTrue is true
+// for conditions like v != nil whose true result implies it, false for ones
+// like v == nil whose false result does. trustSentinels admits comparands and
+// errors.Is targets that are not provably non-nil as deliberate sentinel
+// checks; that reading is only justified in branch position (an `if` written
+// against a sentinel), never when deriving facts from returned values.
+func (c *checker) condImpliesNonNil(cond, v ssa.Value, trustSentinels bool) (onTrue, ok bool) {
+	switch cond := cond.(type) {
+	case *ssa.Call:
+		if isErrorsIsOrAs(cond, v) {
+			// errors.As and errors.AsType are false outright for a nil error,
+			// so only errors.Is needs target scrutiny: Is(nil, nil) is true.
+			target, isIs := errorsIsTarget(cond)
+			if isIs && !c.sentinelTrusted(target, trustSentinels) {
+				return false, false
+			}
+			return true, true
+		}
+		if c.isNonNilPredicateCall(cond, v) {
+			return true, true
+		}
+	case *ssa.Extract:
+		// The ok of a comma-ok type assertion on v: a nil interface never
+		// asserts successfully to any type, so ok being true implies v is
+		// non-nil. This also covers the if-chain a type switch lowers to
+		// (its `case nil` arm lowers to a nil comparison, handled below).
+		ta, isAssert := cond.Tuple.(*ssa.TypeAssert)
+		if isAssert && cond.Index == 1 && ta.CommaOk && nilCheckEquivalent(ta.X, v) {
+			return true, true
+		}
+		// The ok of errors.AsType[T](v): the generic equivalent of
+		// errors.As above — a nil error matches no target type, so ok
+		// being true implies v is non-nil.
+		if call, isCall := cond.Tuple.(*ssa.Call); isCall && cond.Index == 1 && isErrorsAsType(call, v) {
+			return true, true
+		}
+	case *ssa.UnOp:
+		if cond.Op == token.NOT {
+			onTrue, ok = c.condImpliesNonNil(cond.X, v, trustSentinels)
+			return !onTrue, ok
+		}
+	case *ssa.BinOp:
+		return c.compareImpliesNonNil(cond, v, trustSentinels)
+	}
+	return false, false
+}
+
+// compareImpliesNonNil is the comparison case of condImpliesNonNil: an
+// equality or inequality of v against nil or a sentinel.
+func (c *checker) compareImpliesNonNil(cond *ssa.BinOp, v ssa.Value, trustSentinels bool) (onTrue, ok bool) {
+	if cond.Op != token.EQL && cond.Op != token.NEQ {
+		return false, false
+	}
+	var other ssa.Value
+	switch {
+	case nilCheckEquivalent(cond.X, v):
+		other = cond.Y
+	case nilCheckEquivalent(cond.Y, v):
+		other = cond.X
+	default:
+		return false, false
+	}
+	otherIsNil := isNilConst(other)
+	if !otherIsNil && !c.sentinelTrusted(other, trustSentinels) {
+		return false, false
+	}
+	// v == sentinel implies non-nil when true; v == nil implies it when
+	// false. NEQ flips both.
+	onTrue = !otherIsNil
+	if cond.Op == token.NEQ {
+		onTrue = !onTrue
+	}
+	return onTrue, true
+}
+
+// sentinelTrusted reports whether x can stand as the non-nil side of a
+// sentinel check: trusted outright in branch position (an `if` deliberately
+// written against a sentinel), otherwise it must be provably non-nil — a
+// constructed value, a never-nil sentinel var, or a callee with a fact — not,
+// say, a forwarded parameter of the enclosing predicate. Trusting unproven
+// values outside branch position would, for example, derive a predicate fact
+// from the `return err == target` inside errors.Is itself, which is true for
+// a nil err and nil target.
+func (c *checker) sentinelTrusted(x ssa.Value, trustSentinels bool) bool {
+	return trustSentinels || c.valueNonNil(x)
 }
 
 // establishes reports whether a property that holds on branch is guaranteed to
@@ -495,6 +903,53 @@ func isNilChecked(v ssa.Value, block *ssa.BasicBlock) bool {
 // predecessor so it is entered only via its conditional edge (see isNilChecked).
 func establishes(branch, block *ssa.BasicBlock) bool {
 	return len(branch.Preds) == 1 && branch.Dominates(block)
+}
+
+// isNonNilPredicateCall reports whether call is a bool predicate — the
+// `isFooErr(err)` helper shape — whose true result implies v, passed as one of
+// its arguments, is non-nil. Static calls only: the arguments align with the
+// callee's parameters (a method's receiver is argument 0 of both).
+func (c *checker) isNonNilPredicateCall(call *ssa.Call, v ssa.Value) bool {
+	callee := call.Call.StaticCallee()
+	for i, arg := range call.Call.Args {
+		if nilCheckEquivalent(arg, v) && c.calleeTrueImpliesNonNil(callee, i) {
+			return true
+		}
+	}
+	return false
+}
+
+// errorsIsTarget returns the target argument of an errors.Is call; ok is false
+// for any other call.
+func errorsIsTarget(call *ssa.Call) (target ssa.Value, ok bool) {
+	pkg, name, ok := shared.CalleeInfo(call)
+	if !ok || pkg != "errors" || name != "Is" {
+		return nil, false
+	}
+	args := call.Call.Args
+	if len(args) < 2 {
+		return nil, false
+	}
+	return args[1], true
+}
+
+// isErrorsAsType checks if the call is errors.AsType[T](v). Like errors.As, a
+// true ok result implies v is non-nil, since a nil error matches no target
+// type. The callee resolves through Origin because the builder may present
+// the call as a generic instantiation.
+func isErrorsAsType(call *ssa.Call, v ssa.Value) bool {
+	callee := call.Call.StaticCallee()
+	if callee == nil {
+		return false
+	}
+	if origin := callee.Origin(); origin != nil {
+		callee = origin
+	}
+	if callee.Pkg == nil || callee.Pkg.Pkg.Path() != "errors" || callee.Name() != "AsType" {
+		return false
+	}
+	args := call.Call.Args
+	return len(args) > 0 && nilCheckEquivalent(args[0], v)
 }
 
 // isErrorsIsOrAs checks if the call is errors.Is(v, target) or errors.As(v, ...)

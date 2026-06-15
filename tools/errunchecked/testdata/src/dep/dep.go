@@ -67,3 +67,27 @@ func Hidden() hidden { return hidden{} }
 func GenericAlways[T any]() error { // want GenericAlways:`nonNilError\[0\]`
 	return errutil.New(nil)
 }
+
+// IsDep returns true only for non-nil errors, so it carries a predicate fact
+// importing packages can use as a nil check.
+func IsDep(err error) bool { // want IsDep:`nonNilWhenTrue\[0\]`
+	if err == nil {
+		return false
+	}
+	return err.Error() == "dep"
+}
+
+// Truthy can return true for a nil error, so it gets no predicate fact.
+func Truthy(error) bool {
+	return true
+}
+
+// IsDepMerged returns a merged condition; the value-level proof still exports
+// a predicate fact for it.
+func IsDepMerged(err error, other bool) bool { // want IsDepMerged:`nonNilWhenTrue\[0\]`
+	return err != nil && other
+}
+
+// ErrDep is a never-nil sentinel: assigned once at initialization, with a
+// never-escaping address. The fact lets importers prove against it.
+var ErrDep = errutil.New(nil) // want ErrDep:`nonNilVar`
