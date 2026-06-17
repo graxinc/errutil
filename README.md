@@ -148,6 +148,8 @@ return nil
 
 Besides `err != nil` guards, recognized nil checks include equality against a sentinel, `errors.Is`/`errors.As`/`errors.AsType` conditions, comma-ok type assertions, `ctx.Err()` after `<-ctx.Done()`, and bool helper predicates that provably return true only for a non-nil error — through an early `if err == nil { return false }` guard, a merged condition like `return ok && apiErr.Code == code`, or `errors.Is` against a never-nil sentinel var (assigned only non-nil values at initialization, address never escaping).
 
+Wrapping a call is also accepted when it forwards to a nil-preserving helper — a function whose single error result is non-nil whenever its error argument is (e.g. `func(err error) error { if err == nil { return nil }; return wrap(err) }`) — and that argument is itself nil-checked. The preservation property carries transitively and across packages.
+
 Suppress with `//errutil:unchecked` on any line of the call (including later lines of a multiline call), the line above it, on the function, or before the `package` declaration (file-wide).
 
 ### Install

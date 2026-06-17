@@ -1173,3 +1173,77 @@ func badErrorsAsTypeDifferentErr() error {
 	}
 	return nil
 }
+
+// preservesErr returns a non-nil error whenever its argument is non-nil: the
+// nil case returns nil before constructing anything, and every other path wraps
+// the (now nil-checked) argument into a never-nil errutil error.
+func preservesErr(e error) error {
+	if e == nil {
+		return nil
+	}
+	return errutil.With(e)
+}
+
+// Good: wrapping a nil-preserving helper's result needs no check when its
+// argument is itself nil-checked.
+func goodWrapPreservesErr() error {
+	err := returnsErr()
+	if err != nil {
+		return errutil.With(preservesErr(err))
+	}
+	return nil
+}
+
+// Bad: the argument to the preserving helper is unchecked, so its result may be
+// nil and the wrap is still flagged.
+func badWrapPreservesErrUnchecked() error {
+	return errutil.With(preservesErr(returnsErr())) // want `do not directly wrap`
+}
+
+// passthroughErr returns its argument unchanged, so its result is trivially
+// non-nil whenever the argument is.
+func passthroughErr(e error) error { return e }
+
+// Good: a passthrough preserves nil-ness, so a nil-checked argument proves the
+// wrap.
+func goodWrapPassthrough() error {
+	err := returnsErr()
+	if err != nil {
+		return errutil.With(passthroughErr(err))
+	}
+	return nil
+}
+
+// forwardsPreserving forwards to another local preserving helper, so the
+// nil-preserving judgment carries transitively.
+func forwardsPreserving(e error) error { return preservesErr(e) }
+
+// Good: transitivity — wrapping a helper that forwards to a preserving helper.
+func goodWrapForwardsPreserving() error {
+	err := returnsErr()
+	if err != nil {
+		return errutil.With(forwardsPreserving(err))
+	}
+	return nil
+}
+
+var errByKey = map[string]error{}
+
+// notPreserving can return nil for a non-nil input (a missing map key), so it
+// does NOT preserve nil-ness and gets no judgment.
+func notPreserving(e error) error {
+	if e == nil {
+		return nil
+	}
+	return errByKey[e.Error()]
+}
+
+// Bad: a helper that may return nil for a non-nil argument does not prove the
+// wrap even when the argument is nil-checked.
+func badWrapNotPreserving() error {
+	err := returnsErr()
+	if err != nil {
+		return errutil.With(notPreserving(err)) // want `do not directly wrap`
+	}
+	return nil
+}
