@@ -88,6 +88,16 @@ func IsDepMerged(err error, other bool) bool { // want IsDepMerged:`nonNilWhenTr
 	return err != nil && other
 }
 
+// Preserving returns a non-nil error whenever its argument is non-nil — the
+// nil-preserving-wrapper shape — so it carries a nonNilWhenArgNonNil fact that
+// importing packages use to prove Preserving(x) non-nil for a non-nil x.
+func Preserving(err error) error { // want Preserving:`nonNilWhenArgNonNil\[0\]`
+	if err == nil {
+		return nil
+	}
+	return errutil.With(err)
+}
+
 // ErrDep is a never-nil sentinel: assigned once at initialization, with a
 // never-escaping address. The fact lets importers prove against it.
 var ErrDep = errutil.New(nil) // want ErrDep:`nonNilVar`

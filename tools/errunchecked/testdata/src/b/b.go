@@ -106,3 +106,18 @@ func goodWrapDepSentinelPredicate() error {
 	}
 	return nil
 }
+
+// Good: dep.Preserving carries a nonNilWhenArgNonNil fact, so wrapping its
+// result for a nil-checked argument needs no check at the call site.
+func goodWrapDepPreserving() error {
+	err := dep.MaybeErr(true)
+	if err != nil {
+		return errutil.With(dep.Preserving(err))
+	}
+	return nil
+}
+
+// Bad: the argument to dep.Preserving is not checked, so its result may be nil.
+func badWrapDepPreservingUnchecked() error {
+	return errutil.With(dep.Preserving(dep.MaybeErr(true))) // want `do not directly wrap`
+}
