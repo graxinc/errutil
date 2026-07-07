@@ -2,6 +2,7 @@
 package shared
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -9,7 +10,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/graxinc/errutil"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -21,6 +24,7 @@ type Directive struct {
 	File  *token.File
 	Line  int       // -1 for filewide
 	Owner token.Pos // Pos of the syntax node of the function this directive belongs to; NoPos if none/filewide.
+	Doc   bool      // the directive sits in the owner function's doc comment
 	Used  bool
 }
 
@@ -39,7 +43,7 @@ func CollectDirectives(pass *analysis.Pass, prefix string) []*Directive {
 				if filewide {
 					d.Line = -1
 				} else {
-					d.Owner = ownerFunc(pass, f, cg, line)
+					d.Owner, d.Doc = ownerFunc(pass, f, cg, line)
 				}
 				directives = append(directives, d)
 			}
@@ -49,28 +53,29 @@ func CollectDirectives(pass *analysis.Pass, prefix string) []*Directive {
 }
 
 // ownerFunc returns the Pos of the function a directive belongs to: the function
-// whose doc comment is the directive, or the innermost function whose line span
-// contains the directive. Returns NoPos if the directive is not associated with a function.
-func ownerFunc(pass *analysis.Pass, f *ast.File, cg *ast.CommentGroup, line int) token.Pos {
-	owner := token.NoPos
+// whose doc comment contains the directive (doc is true), or the innermost
+// function whose line span contains the directive. Returns NoPos if the
+// directive is not associated with a function.
+func ownerFunc(pass *analysis.Pass, f *ast.File, cg *ast.CommentGroup, line int) (owner token.Pos, doc bool) {
+	owner = token.NoPos
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch fn := n.(type) {
 		case *ast.FuncDecl:
 			if fn.Doc == cg {
-				owner = fn.Pos()
+				owner, doc = fn.Pos(), true
 				return false
 			}
 			if funcLineSpanContains(pass, fn, line) {
-				owner = fn.Pos()
+				owner, doc = fn.Pos(), false
 			}
 		case *ast.FuncLit:
 			if funcLineSpanContains(pass, fn, line) {
-				owner = fn.Pos()
+				owner, doc = fn.Pos(), false
 			}
 		}
 		return true
 	})
-	return owner
+	return owner, doc
 }
 
 func funcLineSpanContains(pass *analysis.Pass, n ast.Node, line int) bool {
@@ -157,10 +162,11 @@ func (c FuncContext) suppressed(directives []*Directive, targetStart, targetEnd 
 		if d.Owner != c.fnPos {
 			continue
 		}
-		// A directive sits on, or one line above, either the function declaration
-		// (suppressing the whole function) or the diagnostic's span (any line of a
-		// multiline subject).
-		if d.Line == c.fnLine || d.Line == c.fnLine-1 ||
+		// A directive suppresses the whole function from any line of the
+		// function's doc comment, its declaration line, or the line above it;
+		// otherwise it must sit on, or one line above, the diagnostic's span
+		// (any line of a multiline subject).
+		if d.Doc || d.Line == c.fnLine || d.Line == c.fnLine-1 ||
 			(d.Line >= targetStart-1 && d.Line <= targetEnd) {
 			d.Used = true
 			return true
@@ -200,9 +206,10 @@ func IsGeneratedFunc(fn *ssa.Function, fset *token.FileSet, generated map[*token
 
 // SubjectEnds maps diagnostic subject positions to the subject's End, so a
 // directive on any line of a multiline subject can suppress its diagnostic via
-// ReportRange: call expressions are keyed by their Lparen (the position SSA
-// call instructions report) and return statements by the return keyword (the
-// position ssa.Return reports). The two position kinds cannot collide.
+// ReportRange: call expressions are keyed by their Lparen (the position
+// ssa.Call reports), return statements by the return keyword (ssa.Return),
+// and defer/go statements by their keyword (ssa.Defer/ssa.Go report the
+// keyword, not the call's Lparen). The position kinds cannot collide.
 func SubjectEnds(fn *ssa.Function) map[token.Pos]token.Pos {
 	ends := map[token.Pos]token.Pos{}
 	ast.Inspect(fn.Syntax(), func(n ast.Node) bool {
@@ -211,6 +218,10 @@ func SubjectEnds(fn *ssa.Function) map[token.Pos]token.Pos {
 			ends[n.Lparen] = n.End()
 		case *ast.ReturnStmt:
 			ends[n.Return] = n.End()
+		case *ast.DeferStmt:
+			ends[n.Defer] = n.End()
+		case *ast.GoStmt:
+			ends[n.Go] = n.End()
 		}
 		return true
 	})
@@ -248,6 +259,12 @@ func UnderlyingCall(v ssa.Value) (call *ssa.Call, ok bool) {
 		}
 	}
 	return nil, false
+}
+
+// IsNilConst reports whether v is the nil constant.
+func IsNilConst(v ssa.Value) bool {
+	c, ok := v.(*ssa.Const)
+	return ok && c.IsNil()
 }
 
 var errType = types.Universe.Lookup("error").Type()
@@ -303,6 +320,27 @@ func WrapsErrorConstructor(call ssa.CallInstruction) bool {
 	}
 	c, ok := UnderlyingCall(args[0])
 	return ok && IsErrorConstructor(c)
+}
+
+// BuildSSA returns the pass's buildssa result.
+func BuildSSA(pass *analysis.Pass) (*buildssa.SSA, error) {
+	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	if !ok {
+		return nil, errutil.New(errutil.Tags{"msg": "unexpected buildssa result type", "type": fmt.Sprintf("%T", pass.ResultOf[buildssa.Analyzer])})
+	}
+	return ssaInfo, nil
+}
+
+// WalkNonGenerated is WalkFunctions minus functions declared in generated
+// files (see GeneratedFiles): diagnostics should not be reported there.
+func WalkNonGenerated(pass *analysis.Pass, ssaInfo *buildssa.SSA, fn func(*ssa.Function)) {
+	generated := GeneratedFiles(pass)
+	WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(f *ssa.Function) {
+		if IsGeneratedFunc(f, pass.Fset, generated) {
+			return
+		}
+		fn(f)
+	})
 }
 
 // WalkFunctions walks all functions in the SSA including anonymous functions.

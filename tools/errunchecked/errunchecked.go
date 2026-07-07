@@ -32,9 +32,9 @@ func Analyzer() *analysis.Analyzer {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-	if !ok {
-		return nil, errutil.New(errutil.Tags{"msg": "unexpected buildssa result type", "type": fmt.Sprintf("%T", pass.ResultOf[buildssa.Analyzer])})
+	ssaInfo, err := shared.BuildSSA(pass)
+	if err != nil {
+		return nil, errutil.With(err)
 	}
 	directives := shared.CollectDirectives(pass, directivePrefix)
 
@@ -59,11 +59,7 @@ func run(pass *analysis.Pass) (any, error) {
 	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, c.exportFacts)
 	c.exportVarFacts()
 
-	generated := shared.GeneratedFiles(pass)
-	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(fn *ssa.Function) {
-		if shared.IsGeneratedFunc(fn, pass.Fset, generated) {
-			return
-		}
+	shared.WalkNonGenerated(pass, ssaInfo, func(fn *ssa.Function) {
 		c.checkFunction(fn, directives)
 	})
 
@@ -186,7 +182,7 @@ func (c *checker) isDirectWrapCall(call ssa.CallInstruction) bool {
 	}
 	// context.Context.Err() is non-nil once the context is done, so wrapping it
 	// inside a <-ctx.Done() branch is safe.
-	if isContextErrInDoneBranch(inner, call.Block()) {
+	if isContextErrInDoneBranch(inner) {
 		return false
 	}
 	return !c.provedNonNil(args[0], call.Block())
@@ -435,7 +431,7 @@ func (c *checker) funcResultNonNil(fn *ssa.Function, idx int) bool {
 	if len(fn.Blocks) == 0 {
 		return false
 	}
-	return memoized(c.memo, c.inProgress, funcResult{fn, idx}, func() bool {
+	return c.memoized(c.memo, c.inProgress, funcResult{fn, idx}, func() bool {
 		return c.computeResultNonNil(fn, idx)
 	})
 }
@@ -443,7 +439,10 @@ func (c *checker) funcResultNonNil(fn *ssa.Function, idx int) bool {
 // memoized returns the cached result for key, running compute on a miss.
 // Recursion is treated conservatively: a key already being computed yields
 // false without caching, so the final verdict is still computed and stored.
-func memoized(memo, inProgress map[funcResult]bool, key funcResult, compute func() bool) bool {
+// A false computed while the sentinel pass is mid-build is provisional (every
+// global conservatively reads as unproven then) and is likewise not cached; a
+// true is monotone and safe to keep.
+func (c *checker) memoized(memo, inProgress map[funcResult]bool, key funcResult, compute func() bool) bool {
 	if v, ok := memo[key]; ok {
 		return v
 	}
@@ -453,7 +452,9 @@ func memoized(memo, inProgress map[funcResult]bool, key funcResult, compute func
 	inProgress[key] = true
 	res := compute()
 	delete(inProgress, key)
-	memo[key] = res
+	if res || !c.sentinelsBuilding {
+		memo[key] = res
+	}
 	return res
 }
 
@@ -489,7 +490,7 @@ func (c *checker) trueImpliesNonNil(fn *ssa.Function, idx int) bool {
 		idx >= len(fn.Params) || !shared.IsErrorType(fn.Params[idx].Type()) {
 		return false
 	}
-	return memoized(c.predMemo, c.predInProgress, funcResult{fn, idx}, func() bool {
+	return c.memoized(c.predMemo, c.predInProgress, funcResult{fn, idx}, func() bool {
 		return c.computeTrueImpliesNonNil(fn, idx)
 	})
 }
@@ -649,7 +650,7 @@ func (c *checker) resultNonNilWhenArgNonNil(fn *ssa.Function, idx int) bool {
 		idx >= len(fn.Params) || !shared.IsErrorType(fn.Params[idx].Type()) {
 		return false
 	}
-	return memoized(c.argMemo, c.argInProgress, funcResult{fn, idx}, func() bool {
+	return c.memoized(c.argMemo, c.argInProgress, funcResult{fn, idx}, func() bool {
 		return c.computeResultNonNilWhenArgNonNil(fn, idx)
 	})
 }
@@ -751,36 +752,55 @@ func isBoolConst(v ssa.Value, b bool) bool {
 	return ok && c.Value != nil && c.Value.Kind() == constant.Bool && constant.BoolVal(c.Value) == b
 }
 
-// isContextErrInDoneBranch reports whether call is ctx.Err() and some block that
-// establishes the context is done dominates block — i.e. the wrap sits on a path
-// taken only after the context is done, where ctx.Err() is guaranteed non-nil.
-func isContextErrInDoneBranch(call *ssa.Call, block *ssa.BasicBlock) bool {
+// isContextErrInDoneBranch reports whether call is ctx.Err() evaluated only
+// after the context is done — a done-establishing point precedes it: an
+// establishing block strictly dominating the call's block, the call's own
+// block when done holds from its entry (a select arm), or a bare receive
+// earlier in the same block. The call, not the wrap, is what must run after
+// done: a ctx.Err() captured before the receive stays possibly-nil no matter
+// where it is wrapped.
+func isContextErrInDoneBranch(call *ssa.Call) bool {
 	recv, ok := contextMethodRecv(call, "Err")
 	if !ok {
 		return false
 	}
-	for _, done := range doneEstablishingBlocks(block.Parent(), recv) {
-		if done.Dominates(block) {
+	block := call.Block()
+	for _, done := range doneEstablishingPoints(block.Parent(), recv) {
+		if done.block != block {
+			if done.block.Dominates(block) {
+				return true
+			}
+			continue
+		}
+		if done.instr == nil || instrPrecedes(block, done.instr, call) {
 			return true
 		}
 	}
 	return false
 }
 
-// doneEstablishingBlocks returns the blocks after which recv (a context) is
-// guaranteed done: the block of a bare <-recv.Done() receive (done holds for the
-// rest of that block onward), and the handler block of a select's <-recv.Done()
-// arm. Crucially a select establishes done only inside its Done arm, not in the
-// select block itself (which dominates every arm, including ones reached while
-// the context is not yet done).
-func doneEstablishingBlocks(fn *ssa.Function, recv ssa.Value) []*ssa.BasicBlock {
-	var blocks []*ssa.BasicBlock
+// donePoint is a program point after which a context is guaranteed done: from
+// instr onward when instr is non-nil (a bare receive), or from block entry
+// when nil (a select arm's handler block).
+type donePoint struct {
+	block *ssa.BasicBlock
+	instr ssa.Instruction
+}
+
+// doneEstablishingPoints returns the points after which recv (a context) is
+// guaranteed done: a bare <-recv.Done() receive (done holds from that
+// instruction onward), and the handler block of a select's <-recv.Done() arm
+// (done holds from its entry). Crucially a select establishes done only inside
+// its Done arm, not in the select block itself (which dominates every arm,
+// including ones reached while the context is not yet done).
+func doneEstablishingPoints(fn *ssa.Function, recv ssa.Value) []donePoint {
+	var points []donePoint
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			switch v := instr.(type) {
 			case *ssa.UnOp:
 				if v.Op == token.ARROW && isContextDoneCall(v.X, recv) {
-					blocks = append(blocks, b)
+					points = append(points, donePoint{b, v})
 				}
 			case *ssa.Select:
 				for i, st := range v.States {
@@ -788,13 +808,26 @@ func doneEstablishingBlocks(fn *ssa.Function, recv ssa.Value) []*ssa.BasicBlock 
 						continue
 					}
 					if h := selectCaseBlock(v, i); h != nil {
-						blocks = append(blocks, h)
+						points = append(points, donePoint{h, nil})
 					}
 				}
 			}
 		}
 	}
-	return blocks
+	return points
+}
+
+// instrPrecedes reports whether a comes before b in block's instruction order.
+func instrPrecedes(block *ssa.BasicBlock, a, b ssa.Instruction) bool {
+	for _, instr := range block.Instrs {
+		switch instr {
+		case a:
+			return true
+		case b:
+			return false
+		}
+	}
+	return false
 }
 
 // selectCaseBlock returns the handler block for the given state index of a
@@ -803,7 +836,7 @@ func doneEstablishingBlocks(fn *ssa.Function, recv ssa.Value) []*ssa.BasicBlock 
 // the matching if's true successor is that case's handler. It returns nil,
 // defensively, if the dispatch does not match this shape — none is known: a
 // single-case select without default compiles to a plain channel receive and
-// never produces a Select at all (the UnOp path in doneEstablishingBlocks
+// never produces a Select at all (the UnOp path in doneEstablishingPoints
 // handles it), and every Select the builder emits uses this dispatch.
 func selectCaseBlock(sel *ssa.Select, stateIdx int) *ssa.BasicBlock {
 	for _, ext := range shared.Referrers(sel) {
@@ -1053,7 +1086,7 @@ func (c *checker) compareImpliesNonNil(cond *ssa.BinOp, v ssa.Value, trustSentin
 	if !ok {
 		return false, false
 	}
-	otherIsNil := isNilConst(other)
+	otherIsNil := shared.IsNilConst(other)
 	if !otherIsNil && !c.sentinelTrusted(other, trustSentinels) {
 		return false, false
 	}
@@ -1081,7 +1114,7 @@ func condImpliesNil(cond, v ssa.Value) (onTrue, ok bool) {
 		}
 	case *ssa.BinOp:
 		other, ok := comparedAgainst(cond, v)
-		if !ok || !isNilConst(other) {
+		if !ok || !shared.IsNilConst(other) {
 			return false, false
 		}
 		// v == nil is true exactly when v is nil; != flips.
@@ -1187,13 +1220,8 @@ func isErrorsIsOrAs(call *ssa.Call, v ssa.Value) bool {
 	}
 	// errors.Is(v, nil) is true only when v IS nil. (errors.As's target is a
 	// non-nil pointer, so it has no equivalent case.)
-	if name == "Is" && len(args) >= 2 && isNilConst(args[1]) {
+	if name == "Is" && len(args) >= 2 && shared.IsNilConst(args[1]) {
 		return false
 	}
 	return true
-}
-
-func isNilConst(v ssa.Value) bool {
-	c, ok := v.(*ssa.Const)
-	return ok && c.IsNil()
 }

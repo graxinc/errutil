@@ -7,7 +7,6 @@
 package errwrap
 
 import (
-	"fmt"
 	"go/token"
 	"go/types"
 
@@ -34,9 +33,9 @@ func Analyzer() *analysis.Analyzer {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	ssaInfo, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-	if !ok {
-		return nil, errutil.New(errutil.Tags{"msg": "unexpected buildssa result type", "type": fmt.Sprintf("%T", pass.ResultOf[buildssa.Analyzer])})
+	ssaInfo, err := shared.BuildSSA(pass)
+	if err != nil {
+		return nil, errutil.With(err)
 	}
 	unwrappedDirectives := shared.CollectDirectives(pass, directiveUnwrapped)
 	newDirectives := shared.CollectDirectives(pass, directiveNew)
@@ -48,11 +47,7 @@ func run(pass *analysis.Pass) (any, error) {
 		inProg: map[fieldKey]bool{},
 	}
 
-	generated := shared.GeneratedFiles(pass)
-	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(fn *ssa.Function) {
-		if shared.IsGeneratedFunc(fn, pass.Fset, generated) {
-			return
-		}
+	shared.WalkNonGenerated(pass, ssaInfo, func(fn *ssa.Function) {
 		chk.checkFunction(fn, unwrappedDirectives, newDirectives)
 	})
 
@@ -167,7 +162,7 @@ func (c *checker) isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 		return c.isWrapped(val.X, visited)
 	case *ssa.UnOp:
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
-			return c.isAllocWrapped(alloc, val.Block(), visited)
+			return c.isAllocWrapped(alloc, val, visited)
 		}
 		// A load of a struct field is wrapped when the field is provably
 		// always-wrapped across the whole package (see isFieldAlwaysWrapped).
@@ -181,29 +176,39 @@ func (c *checker) isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 	return false
 }
 
-func (c *checker) isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) bool {
+func (c *checker) isAllocWrapped(alloc *ssa.Alloc, load *ssa.UnOp, visited map[ssa.Value]bool) bool {
 	if alloc.Referrers() == nil {
 		return false
 	}
 	// A deferred closure that stores into alloc (a captured named result) runs
-	// after every return statement, so its stores determine the value callers
-	// observe, overriding any store made before the return — e.g. the idiomatic
-	// `defer func() { err = errutil.With(err) }()`.
-	if wrapped, found := c.deferredStoresWrapped(alloc, loadBlock, visited); found {
-		return wrapped
+	// after every return statement, so its stores can override any store made
+	// before the return — e.g. the idiomatic `defer func() { err = errutil.With(err) }()`.
+	wrapped, overrides, found := c.deferredStoresWrapped(alloc, load.Block(), visited)
+	if found {
+		if !wrapped {
+			return false
+		}
+		if overrides {
+			return true
+		}
+		// The deferred stores are wrapped but conditional on something other
+		// than the value's nil-ness, so the pre-return value can still reach
+		// callers on their skip path — it must be wrapped too (checked below).
 	}
-	// If the load's block contains stores, the last one (in instruction order)
-	// dominates the load, so only its value matters — earlier stores are overwritten.
-	if loadBlock != nil {
-		var lastStore *ssa.Store
-		for _, instr := range loadBlock.Instrs {
-			if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
-				lastStore = store
-			}
+	// If the load's block contains stores before the load, the last one
+	// dominates it, so only its value matters — earlier stores are overwritten,
+	// and stores after the load cannot affect it.
+	var lastStore *ssa.Store
+	for _, instr := range load.Block().Instrs {
+		if instr == load {
+			break
 		}
-		if lastStore != nil {
-			return c.isWrapped(lastStore.Val, visited)
+		if store, ok := instr.(*ssa.Store); ok && store.Addr == alloc {
+			lastStore = store
 		}
+	}
+	if lastStore != nil {
+		return c.isWrapped(lastStore.Val, visited)
 	}
 	// Fallback: check all stores across all blocks.
 	for _, ref := range *alloc.Referrers() {
@@ -218,12 +223,17 @@ func (c *checker) isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, vi
 
 // deferredStoresWrapped inspects deferred closures in alloc's function that
 // capture alloc and store to it. found is false when no such store exists.
-// Otherwise wrapped reports whether every such store is wrapped. Only defers
-// guaranteed to be registered before the load (their block dominates the load's
-// block) are considered: a conditionally registered defer cannot vouch for
-// every path.
-func (c *checker) deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) (wrapped, found bool) {
-	wrapped = true
+// wrapped reports whether every such store is wrapped. overrides reports
+// whether the deferred stores alone determine the value callers observe:
+// every store must run on every path through its closure, or be guarded by a
+// nil check on the captured value itself (the idiomatic
+// `if err != nil { err = errutil.With(err) }`, whose skip path leaves only a
+// nil behind). A store under any other condition cannot vouch for the
+// pre-return value on its skip path. Only defers guaranteed to be registered
+// before the load (their block dominates the load's block) are considered: a
+// conditionally registered defer cannot vouch for every path.
+func (c *checker) deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) (wrapped, overrides, found bool) {
+	wrapped, overrides = true, true
 	for _, b := range alloc.Parent().Blocks {
 		for _, instr := range b.Instrs {
 			d, ok := instr.(*ssa.Defer)
@@ -242,18 +252,77 @@ func (c *checker) deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBl
 				if binding != alloc {
 					continue
 				}
-				for _, ref := range shared.Referrers(closure.FreeVars[i]) {
+				fv := closure.FreeVars[i]
+				for _, ref := range shared.Referrers(fv) {
 					store, ok := ref.(*ssa.Store)
 					if !ok {
 						continue
 					}
 					found = true
 					wrapped = wrapped && c.isWrapped(store.Val, visited)
+					overrides = overrides && storeOverrides(store, fv, closure)
 				}
 			}
 		}
 	}
-	return wrapped, found
+	return wrapped, overrides, found
+}
+
+// storeOverrides reports whether a deferred store determines the value callers
+// observe regardless of the pre-return value: it runs on every completing path
+// through the closure, or it is guarded by a nil check on the captured value
+// itself, so the only pre-return value surviving its skip path is nil.
+// ponytail: only the immediate `if *fv != nil`-shaped guard on an
+// every-path branch is recognized; extend to dominated guards if real code
+// needs it.
+func storeOverrides(store *ssa.Store, fv *ssa.FreeVar, closure *ssa.Function) bool {
+	if dominatesAllReturns(store.Block(), closure) {
+		return true
+	}
+	b := store.Block()
+	if len(b.Preds) != 1 {
+		return false
+	}
+	pred := b.Preds[0]
+	if !dominatesAllReturns(pred, closure) || len(pred.Instrs) == 0 {
+		return false
+	}
+	ifInstr, ok := pred.Instrs[len(pred.Instrs)-1].(*ssa.If)
+	if !ok || pred.Succs[0] == pred.Succs[1] {
+		return false
+	}
+	cmp, ok := ifInstr.Cond.(*ssa.BinOp)
+	if !ok || (cmp.Op != token.EQL && cmp.Op != token.NEQ) || !isNilCheckOf(cmp, fv) {
+		return false
+	}
+	nonNil := pred.Succs[0] // NEQ: the true branch is the non-nil one; EQL flips.
+	if cmp.Op == token.EQL {
+		nonNil = pred.Succs[1]
+	}
+	return b == nonNil
+}
+
+// isNilCheckOf reports whether cmp compares a load of fv against nil.
+func isNilCheckOf(cmp *ssa.BinOp, fv *ssa.FreeVar) bool {
+	isLoad := func(v ssa.Value) bool {
+		un, ok := v.(*ssa.UnOp)
+		return ok && un.Op == token.MUL && un.X == fv
+	}
+	return (isLoad(cmp.X) && shared.IsNilConst(cmp.Y)) || (shared.IsNilConst(cmp.X) && isLoad(cmp.Y))
+}
+
+// dominatesAllReturns reports whether b dominates every return block of fn —
+// i.e. every completing path through fn passes through b.
+func dominatesAllReturns(b *ssa.BasicBlock, fn *ssa.Function) bool {
+	for _, rb := range fn.Blocks {
+		if len(rb.Instrs) == 0 {
+			continue
+		}
+		if _, ok := rb.Instrs[len(rb.Instrs)-1].(*ssa.Return); ok && !b.Dominates(rb) {
+			return false
+		}
+	}
+	return true
 }
 
 // fieldKey identifies a struct field by its named struct type and field index.
