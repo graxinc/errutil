@@ -457,3 +457,71 @@ func goodUnreachableReturn(err error) error {
 	exits()
 	return err
 }
+
+// Bad: the value loaded before a later wrapped store is the raw error; a store
+// only governs loads after it in the block.
+func badStoreAfterLoad() error {
+	var err error
+	err = errors.New("")
+	e := err
+	err = errutil.With(err)
+	sinkErr(&err)
+	return e // want `error should be wrapped`
+}
+
+// Good: a load after the wrapped store observes it; the later unwrapped store
+// does not affect the loaded value.
+func goodStoreAfterLoadIgnored() error {
+	var err error
+	err = errutil.New(errutil.Tags{})
+	e := err
+	err = errors.New("")
+	sinkErr(&err)
+	return e
+}
+
+// Bad: a deferred store guarded by a condition unrelated to the value's
+// nil-ness does not vouch — on the skip path callers observe the raw
+// pre-return store.
+func badDeferConditionalUnrelated(cond bool) (err error) {
+	defer func() {
+		if cond {
+			err = errutil.With(err)
+		}
+	}()
+	err = errors.New("")
+	return // want `error should be wrapped`
+}
+
+// Good: an unrelated-conditional deferred wrap is fine when the pre-return
+// value is itself wrapped (both the deferred and the surviving value are).
+func goodDeferConditionalUnrelatedWrapped(cond bool) (err error) {
+	defer func() {
+		if cond {
+			err = errutil.With(err)
+		}
+	}()
+	err = errutil.New(errutil.Tags{})
+	return
+}
+
+// Good: the early-return form of the nil-guarded deferred wrap — the skip path
+// leaves only a nil behind, so the store vouches for any pre-return value.
+func goodDeferWrapNamedEarlyReturn() (err error) {
+	defer func() {
+		if err == nil {
+			return
+		}
+		err = errutil.With(err)
+	}()
+	err = errors.New("")
+	return
+}
+
+// Good: a directive on a later line of a multiline deferred constructor wrap
+// suppresses via the defer statement's span (ssa.Defer reports the defer
+// keyword's position).
+func goodDeferMultilineNewDirective() {
+	defer errutil.With(
+		errors.New("")) //errutil:new
+}

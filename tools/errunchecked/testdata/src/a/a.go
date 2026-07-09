@@ -1247,3 +1247,71 @@ func badWrapNotPreserving() error {
 	}
 	return nil
 }
+
+// Bad: the wrap runs before the Done receive in the same block — the context
+// may not be done yet when Err is evaluated.
+func badCtxErrWrapBeforeDone(ctx context.Context) error {
+	e := errutil.With(ctx.Err()) // want `do not directly wrap`
+	<-ctx.Done()
+	return e
+}
+
+// Bad: a ctx.Err() captured before the Done receive stays possibly-nil no
+// matter where it is wrapped — in the same block as the receive...
+func badCtxErrCapturedBeforeDone(ctx context.Context) error {
+	e := ctx.Err()
+	<-ctx.Done()
+	return errutil.With(e) // want `do not directly wrap`
+}
+
+// ...or with the receive in a block that dominates the wrap but not the call.
+func badCtxErrCapturedBeforeDoneCrossBlock(ctx context.Context, cond bool) error {
+	e := ctx.Err()
+	if cond {
+		_ = e
+	}
+	<-ctx.Done()
+	return errutil.With(e) // want `do not directly wrap`
+}
+
+// Good: ctx.Err() captured in the Done arm is non-nil wherever it is wrapped —
+// done is established at the arm's entry, before the call.
+func goodCtxErrCapturedInDoneArm(ctx context.Context, c <-chan int, cond bool) error {
+	select {
+	case <-ctx.Done():
+		e := ctx.Err()
+		if cond {
+			_ = e
+		}
+		return errutil.With(e)
+	case <-c:
+		return nil
+	}
+}
+
+// Good: a directive on a later line of a multiline deferred wrap suppresses
+// (ssa.Defer reports the defer keyword's position, which maps to the
+// statement's span).
+func goodDeferMultilineDirective() {
+	defer errutil.With(
+		returnsErr()) //errutil:unchecked
+}
+
+// goodDirectiveInDocMiddle has its directive on a middle line of a multi-line
+// doc comment; any line of the owning doc comment suppresses the function.
+//errutil:unchecked
+// More documentation below the directive.
+func goodDirectiveInDocMiddle() error {
+	return errutil.With(returnsErr())
+}
+
+// Limitation (codified): equality between two maybe-nil errors is trusted as a
+// deliberate sentinel check in branch position, so the wrap is not flagged even
+// though both sides may be nil (nil == nil is true).
+func goodEqualMaybeNilLimitation(err2 error) error {
+	err := returnsErr()
+	if err == err2 {
+		return errutil.With(err)
+	}
+	return nil
+}
