@@ -1,3 +1,7 @@
+// NOTE: This analyzer was written largely with the assistance of LLM tooling.
+// The SSA dataflow reasoning here is subtle (concurrency soundness, cycle
+// handling, go/ssa lowering quirks), so review and test changes with care.
+
 // Package errwrap provides a Go analyzer that ensures all error returns
 // are wrapped with errutil.With or errutil.Wrap instead of being returned directly.
 package errwrap

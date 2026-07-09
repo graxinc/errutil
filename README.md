@@ -116,59 +116,42 @@ if err := topOfCalls(); err != nil {
 
 ## Tools
 
-The `tools/` directory contains static analyzers to enforce correct errutil usage patterns.
+The `tools/` directory is a separate Go module of static analyzers that enforce the usage patterns above.
 
-### errwrap
+> **Disclaimer:** these analyzers were written largely with the assistance of LLM tooling. Their SSA-based dataflow reasoning is subtle, so review and test changes with care.
 
-Ensures all returned errors are wrapped with `errutil.With`, `errutil.Wrap`, or variants.
+**State:** two analyzers (`errwrap`, `errunchecked`), SSA-based, distributed as standalone binaries under `cmd/`. Both report unused suppression directives as failures.
 
-Rules:
+The rule summaries below are intentionally brief. The `testdata/src/a/a.go` file for each analyzer is the authoritative specification; every accepted and flagged case is a labeled example, and reviewing it directly is the most complete demonstration of the rules.
 
-* **unwrapped** — returning errors without wrapping (`return err`, `return errors.New("x")`, etc.)
-* **new** — wrapping `errors.New` or `fmt.Errorf` instead of using `errutil.New`
+### errwrap — [testdata](tools/errwrap/testdata/src/a/a.go)
 
-Suppress with `//errutil:unwrapped` or `//errutil:new` on any line of the statement (including later lines of a multiline call or return), the line above it, on the function, or before the `package` declaration (file-wide).
+Every returned error must carry errutil location info.
 
-### errunchecked
+* **unwrapped** — a returned error that isn't wrapped (`return err`, `return errors.New(...)`, a bare field/map/index/call result).
+* **new** — wrapping `errors.New`/`fmt.Errorf`; use `errutil.New` instead.
 
-Ensures `errutil.With`/`Wrap` is not called directly on a function call result without a nil check.
+Accepted (not flagged): `nil`, any value traced back to an errutil wrap, `Base() error` accessors, and struct fields whose every assignment is wrapped.
 
-Catches:
+### errunchecked — [testdata](tools/errunchecked/testdata/src/a/a.go)
 
-* `return errutil.With(f())` — wraps nil errors unnecessarily, potentially leading to correctness issues
+* **unchecked** — `errutil.With`/`Wrap` applied to a call result with no preceding nil check (e.g. `return errutil.With(f())`), which would wrap a possibly-nil error.
 
-Correct pattern:
+Accepted: the wrap sits behind a recognized nil check — `err != nil`, sentinel equality, `errors.Is`/`As`, comma-ok assertions, `ctx.Err()`, provably-non-nil bool predicates, or a nil-preserving helper.
 
-```go
-if err := f(); err != nil {
-    return errutil.With(err)
-}
-return nil
-```
+### Suppressing
 
-Besides `err != nil` guards, recognized nil checks include equality against a sentinel, `errors.Is`/`errors.As`/`errors.AsType` conditions, comma-ok type assertions, `ctx.Err()` after `<-ctx.Done()`, and bool helper predicates that provably return true only for a non-nil error — through an early `if err == nil { return false }` guard, a merged condition like `return ok && apiErr.Code == code`, or `errors.Is` against a never-nil sentinel var (assigned only non-nil values at initialization, address never escaping).
+Place `//errutil:unwrapped`, `//errutil:new`, or `//errutil:unchecked` on the statement (any line of a multiline call/return), the line above it, on the function, or before the `package` declaration (file-wide). Generated files (`// Code generated ... DO NOT EDIT.`) are not checked, though their functions still contribute non-nil facts to errunchecked.
 
-Wrapping a call is also accepted when it forwards to a nil-preserving helper — a function whose single error result is non-nil whenever its error argument is (e.g. `func(err error) error { if err == nil { return nil }; return wrap(err) }`) — and that argument is itself nil-checked. The preservation property carries transitively and across packages.
-
-Suppress with `//errutil:unchecked` on any line of the call (including later lines of a multiline call), the line above it, on the function, or before the `package` declaration (file-wide).
-
-### Install
+### Install & run
 
 ```bash
 go install github.com/graxinc/errutil/tools/errwrap/cmd/errwrap@latest
 go install github.com/graxinc/errutil/tools/errunchecked/cmd/errunchecked@latest
-```
 
-### Run
-
-```bash
 errwrap ./...
 errunchecked ./...
 ```
-
-Both tools flag unnecessary directives as failures.
-
-Generated files (marked `// Code generated ... DO NOT EDIT.`) are not checked: they cannot be hand-fixed, and regeneration would discard directives. Functions in generated files still contribute non-nil facts to errunchecked.
 
 ## Future improvements
 

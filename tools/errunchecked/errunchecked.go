@@ -1,3 +1,6 @@
+// NOTE: This analyzer was written largely with the assistance of LLM tooling.
+// The SSA dataflow reasoning here is subtle, so review and test changes with care.
+
 // Package errunchecked provides a Go analyzer that detects when errutil.With or errutil.Wrap
 // is called directly on a function call result without first checking for nil.
 package errunchecked
