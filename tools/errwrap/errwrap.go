@@ -276,10 +276,10 @@ func (c *checker) deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBl
 // every-path branch is recognized; extend to dominated guards if real code
 // needs it.
 func storeOverrides(store *ssa.Store, fv *ssa.FreeVar, closure *ssa.Function) bool {
-	if dominatesAllReturns(store.Block(), closure) {
+	b := store.Block()
+	if dominatesAllReturns(b, closure) {
 		return true
 	}
-	b := store.Block()
 	if len(b.Preds) != 1 {
 		return false
 	}
