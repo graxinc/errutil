@@ -1,3 +1,7 @@
+// NOTE: This analyzer was written largely with the assistance of LLM tooling.
+// The SSA dataflow reasoning here is subtle (concurrency soundness, cycle
+// handling, go/ssa lowering quirks), so review and test changes with care.
+
 // Package errwrap provides a Go analyzer that ensures all error returns
 // are wrapped with errutil.With or errutil.Wrap instead of being returned directly.
 package errwrap
@@ -5,6 +9,7 @@ package errwrap
 import (
 	"fmt"
 	"go/token"
+	"go/types"
 
 	"github.com/graxinc/errutil"
 	"github.com/graxinc/errutil/tools/internal/shared"
@@ -36,12 +41,19 @@ func run(pass *analysis.Pass) (any, error) {
 	unwrappedDirectives := shared.CollectDirectives(pass, directiveUnwrapped)
 	newDirectives := shared.CollectDirectives(pass, directiveNew)
 
+	chk := &checker{
+		pass:   pass,
+		fields: collectFieldWrites(ssaInfo),
+		memo:   map[fieldKey]bool{},
+		inProg: map[fieldKey]bool{},
+	}
+
 	generated := shared.GeneratedFiles(pass)
 	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(fn *ssa.Function) {
 		if shared.IsGeneratedFunc(fn, pass.Fset, generated) {
 			return
 		}
-		checkFunction(pass, fn, unwrappedDirectives, newDirectives)
+		chk.checkFunction(fn, unwrappedDirectives, newDirectives)
 	})
 
 	shared.ReportUnused(pass, unwrappedDirectives, "unused errutil:unwrapped directive")
@@ -49,12 +61,28 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, newDirectives []*shared.Directive) {
-	ctx, ok := shared.NewFuncContext(pass, fn)
+// checker holds the per-package state that the wrap checks read. isWrapped has
+// no package-wide view on its own; the fields map, precomputed once, lets
+// isFieldAlwaysWrapped prove a whole-field invariant without re-walking the
+// package per query. memo/inProg memoize that per-field result and break cycles.
+type checker struct {
+	pass   *analysis.Pass
+	fields map[fieldKey]*fieldWrites
+	memo   map[fieldKey]bool
+	inProg map[fieldKey]bool
+}
+
+func (c *checker) checkFunction(fn *ssa.Function, unwrappedDirectives, newDirectives []*shared.Directive) {
+	ctx, ok := shared.NewFuncContext(c.pass, fn)
 	if !ok {
 		return
 	}
 	errIndices := shared.ErrorResultIndices(fn.Signature)
+	// A Baser accessor (`func (T) Base() error`) must return its underlying error
+	// RAW — wrapping there is wrong (it stamps a bogus frame on every chain walk
+	// and breaks the errutil.Baser contract). Name+signature is exactly Baser, so
+	// exempt such methods from the unwrapped rule. The errutil:new rule is unaffected.
+	baserAccessor := isBaserAccessor(fn)
 	var ends map[token.Pos]token.Pos // built lazily; most functions report nothing
 	endOf := func(pos token.Pos) token.Pos {
 		if ends == nil {
@@ -77,11 +105,14 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, n
 			if !ok || !ret.Pos().IsValid() {
 				continue
 			}
+			if baserAccessor {
+				continue
+			}
 			for _, errIdx := range errIndices {
 				if errIdx >= len(ret.Results) {
 					continue
 				}
-				if !isWrapped(ret.Results[errIdx], make(map[ssa.Value]bool)) {
+				if !c.isWrapped(ret.Results[errIdx], make(map[ssa.Value]bool)) {
 					ctx.ReportRange(unwrappedDirectives, ret.Pos(), endOf(ret.Pos()),
 						"error should be wrapped with errutil.With or errutil.Wrap")
 				}
@@ -90,7 +121,20 @@ func checkFunction(pass *analysis.Pass, fn *ssa.Function, unwrappedDirectives, n
 	}
 }
 
-func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
+// isBaserAccessor reports whether fn has exactly the errutil.Baser signature:
+// a method named "Base" with no parameters (besides the receiver) and a single
+// error result. Keying on name+signature is sufficient; a coincidental non-Baser
+// Base() error being exempted from a wrap-nag is harmless.
+func isBaserAccessor(fn *ssa.Function) bool {
+	sig := fn.Signature
+	return fn.Name() == "Base" &&
+		sig.Recv() != nil &&
+		sig.Params().Len() == 0 &&
+		sig.Results().Len() == 1 &&
+		shared.IsErrorType(sig.Results().At(0).Type())
+}
+
+func (c *checker) isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 	// A nil value is a nil error (fine to return unwrapped); an already-visited
 	// value means we are following a cycle (e.g. a phi feeding itself), which we
 	// treat as wrapped so the recursion terminates without a false positive.
@@ -106,7 +150,7 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 		return shared.IsErrUtilCall(val)
 	case *ssa.Phi:
 		for _, edge := range val.Edges {
-			if !isWrapped(edge, visited) {
+			if !c.isWrapped(edge, visited) {
 				return false
 			}
 		}
@@ -116,21 +160,28 @@ func isWrapped(v ssa.Value, visited map[ssa.Value]bool) bool {
 			return shared.IsErrUtilCall(call)
 		}
 	case *ssa.MakeInterface:
-		return isWrapped(val.X, visited)
+		return c.isWrapped(val.X, visited)
 	case *ssa.ChangeInterface:
-		return isWrapped(val.X, visited)
+		return c.isWrapped(val.X, visited)
 	case *ssa.TypeAssert:
-		return isWrapped(val.X, visited)
+		return c.isWrapped(val.X, visited)
 	case *ssa.UnOp:
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
-			return isAllocWrapped(alloc, val.Block(), visited)
+			return c.isAllocWrapped(alloc, val.Block(), visited)
 		}
-		return isWrapped(val.X, visited)
+		// A load of a struct field is wrapped when the field is provably
+		// always-wrapped across the whole package (see isFieldAlwaysWrapped).
+		if fa, ok := val.X.(*ssa.FieldAddr); ok {
+			if key, ok := fieldAddrKey(fa); ok && c.isFieldAlwaysWrapped(key) {
+				return true
+			}
+		}
+		return c.isWrapped(val.X, visited)
 	}
 	return false
 }
 
-func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) bool {
+func (c *checker) isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) bool {
 	if alloc.Referrers() == nil {
 		return false
 	}
@@ -138,7 +189,7 @@ func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa
 	// after every return statement, so its stores determine the value callers
 	// observe, overriding any store made before the return — e.g. the idiomatic
 	// `defer func() { err = errutil.With(err) }()`.
-	if wrapped, found := deferredStoresWrapped(alloc, loadBlock, visited); found {
+	if wrapped, found := c.deferredStoresWrapped(alloc, loadBlock, visited); found {
 		return wrapped
 	}
 	// If the load's block contains stores, the last one (in instruction order)
@@ -151,13 +202,13 @@ func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa
 			}
 		}
 		if lastStore != nil {
-			return isWrapped(lastStore.Val, visited)
+			return c.isWrapped(lastStore.Val, visited)
 		}
 	}
 	// Fallback: check all stores across all blocks.
 	for _, ref := range *alloc.Referrers() {
 		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
-			if !isWrapped(store.Val, visited) {
+			if !c.isWrapped(store.Val, visited) {
 				return false
 			}
 		}
@@ -171,7 +222,7 @@ func isAllocWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa
 // guaranteed to be registered before the load (their block dominates the load's
 // block) are considered: a conditionally registered defer cannot vouch for
 // every path.
-func deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) (wrapped, found bool) {
+func (c *checker) deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited map[ssa.Value]bool) (wrapped, found bool) {
 	wrapped = true
 	for _, b := range alloc.Parent().Blocks {
 		for _, instr := range b.Instrs {
@@ -197,10 +248,141 @@ func deferredStoresWrapped(alloc *ssa.Alloc, loadBlock *ssa.BasicBlock, visited 
 						continue
 					}
 					found = true
-					wrapped = wrapped && isWrapped(store.Val, visited)
+					wrapped = wrapped && c.isWrapped(store.Val, visited)
 				}
 			}
 		}
 	}
 	return wrapped, found
+}
+
+// fieldKey identifies a struct field by its named struct type and field index.
+type fieldKey struct {
+	named *types.Named
+	field int
+}
+
+// fieldWrites records, for one field key, every store to it seen in the package
+// and whether the field's address ever escapes past a plain store/load.
+type fieldWrites struct {
+	stores  []*ssa.Store
+	escapes bool
+}
+
+// fieldAddrKey returns the (named struct type, field index) key for fa. ok is
+// false when fa's struct is not a named type — an unnamed struct can never be
+// in scope for the always-wrapped rule, so callers bail (treat as unwrapped).
+func fieldAddrKey(fa *ssa.FieldAddr) (fieldKey, bool) {
+	ptr, ok := fa.X.Type().(*types.Pointer)
+	if !ok {
+		return fieldKey{}, false
+	}
+	named, ok := ptr.Elem().(*types.Named)
+	if !ok {
+		return fieldKey{}, false
+	}
+	return fieldKey{named: named, field: fa.Field}, true
+}
+
+// collectFieldWrites walks the whole package once, grouping every *ssa.FieldAddr
+// by field key. For each it records stores through that address and flags escape
+// (any use other than being a store's Addr or a load's operand). This is the
+// single package-wide walk isFieldAlwaysWrapped reads from.
+func collectFieldWrites(ssaInfo *buildssa.SSA) map[fieldKey]*fieldWrites {
+	m := map[fieldKey]*fieldWrites{}
+	shared.WalkFunctions(ssaInfo.Pkg, ssaInfo.SrcFuncs, func(fn *ssa.Function) {
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				fa, ok := instr.(*ssa.FieldAddr)
+				if !ok {
+					continue
+				}
+				key, ok := fieldAddrKey(fa)
+				if !ok {
+					continue
+				}
+				fw := m[key]
+				if fw == nil {
+					fw = &fieldWrites{}
+					m[key] = fw
+				}
+				for _, ref := range shared.Referrers(fa) {
+					switch r := ref.(type) {
+					case *ssa.Store:
+						if r.Addr == fa {
+							fw.stores = append(fw.stores, r)
+						} else {
+							fw.escapes = true // fa stored as a value ⇒ address escapes
+						}
+					case *ssa.UnOp:
+						if r.Op != token.MUL || r.X != fa {
+							fw.escapes = true
+						}
+					default:
+						fw.escapes = true
+					}
+				}
+			}
+		}
+	})
+	return m
+}
+
+// isFieldAlwaysWrapped reports whether every value ever assigned to the field is
+// wrapped (or nil). If so, then under the data-race-free assumption any read
+// observes some wrapped value regardless of goroutine interleaving, so no
+// ordering/adjacency reasoning is needed and there is no concurrency hole.
+//
+// Soundness rests on guard #1 (SCOPE): an unexported field of a package-local
+// type can only be written from this package, so the package's SSA holds EVERY
+// write. That is what makes the package-local enumeration in collectFieldWrites
+// complete — without it "all writes seen here" would not mean "all writes".
+func (c *checker) isFieldAlwaysWrapped(key fieldKey) bool {
+	if v, ok := c.memo[key]; ok {
+		return v
+	}
+	// A field whose wrappedness recursively depends on itself: treat the
+	// in-progress edge as wrapped so recursion terminates, matching the
+	// phi-cycle handling in isWrapped.
+	if c.inProg[key] {
+		return true
+	}
+	c.inProg[key] = true
+	result := c.computeFieldAlwaysWrapped(key)
+	delete(c.inProg, key)
+	c.memo[key] = result
+	return result
+}
+
+func (c *checker) computeFieldAlwaysWrapped(key fieldKey) bool {
+	// Guard #1: SCOPE — unexported field of a named struct declared in this package.
+	obj := key.named.Obj()
+	if obj == nil || obj.Pkg() != c.pass.Pkg {
+		return false
+	}
+	st, ok := key.named.Underlying().(*types.Struct)
+	if !ok || key.field >= st.NumFields() || st.Field(key.field).Exported() {
+		return false
+	}
+	fw := c.fields[key]
+	// A field with no writes at all is not a wrapped-by-construction field; it is
+	// just a zero value being read. Leave such reads flagged (the safe direction —
+	// returning false can only ever cause more flagging, never a false negative).
+	if fw == nil || len(fw.stores) == 0 {
+		return false
+	}
+	// Guard #2: NO ESCAPE — a write could otherwise occur through an unseen pointer.
+	if fw.escapes {
+		return false
+	}
+	// Guard #3: ALL WRITES WRAPPED. go/ssa lowers composite literals (T{err: x})
+	// to Alloc+FieldAddr+Store, so this enumeration also covers constructor and
+	// literal initialization — essential, since a constructor storing a
+	// caller-supplied error means the field is NOT always wrapped.
+	for _, store := range fw.stores {
+		if !c.isWrapped(store.Val, make(map[ssa.Value]bool)) {
+			return false
+		}
+	}
+	return true
 }

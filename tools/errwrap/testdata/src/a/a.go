@@ -338,6 +338,116 @@ func badDirectiveBelowReturn(err error) error {
 	//errutil:unwrapped // want `unused errutil:unwrapped directive`
 }
 
+// Good: a Baser accessor (`func (T) Base() error`) must return its underlying
+// error raw, so the unwrapped rule is exempt for the whole method.
+type baserField struct{ err error }
+
+func (t baserField) Base() error { return t.err }
+
+// Good: the exemption covers any unwrapped value returned from Base(), not just
+// the field.
+type baserLocal struct{}
+
+func (baserLocal) Base() error {
+	err := errors.New("")
+	return err
+}
+
+// Bad: a method named Base with a non-Baser signature is not exempt.
+type baserMultiResult struct{ err error }
+
+func (t baserMultiResult) Base() (error, bool) {
+	return t.err, true // want `error should be wrapped`
+}
+
+type baserParam struct{ err error }
+
+func (t baserParam) Base(int) error {
+	return t.err // want `error should be wrapped`
+}
+
+// Bad: a non-Base method returning an unwrapped field is unchanged.
+type notBaser struct{ err error }
+
+func (t notBaser) badCause() error {
+	return t.err // want `error should be wrapped`
+}
+
+// Good: a sticky-error field whose every write (across more than one method) is
+// wrapped or nil. Both a plain and a multi-value return of the field are accepted.
+type stickyWriter struct{ err error }
+
+func (w *stickyWriter) storeWrapped(err error) {
+	w.err = errutil.With(err)
+}
+
+func (w *stickyWriter) clearErr() {
+	w.err = nil
+}
+
+func (w *stickyWriter) goodStickyField() error {
+	return w.err
+}
+
+func (w *stickyWriter) goodStickyFieldMulti() (int, int, error) {
+	return 0, 0, w.err
+}
+
+// Bad: a constructor stores a caller-supplied error into the field via a
+// composite literal, so not every write is wrapped (guard #3).
+type ctorField struct{ err error }
+
+func newCtorField(err error) ctorField {
+	return ctorField{err: err}
+}
+
+func (t *ctorField) badCtorField() error {
+	return t.err // want `error should be wrapped`
+}
+
+// Bad: one method assigns a raw error while others wrap (guard #3).
+type mixedWrites struct{ err error }
+
+func (w *mixedWrites) storeWrapped(err error) {
+	w.err = errutil.With(err)
+}
+
+func (w *mixedWrites) storeRaw(err error) {
+	w.err = err
+}
+
+func (w *mixedWrites) badMixedWrites() error {
+	return w.err // want `error should be wrapped`
+}
+
+// Bad: an exported field is writable from other packages, so package-local
+// enumeration is not complete — bail even though all writes wrap (guard #1).
+type exportedField struct{ Err error }
+
+func (w *exportedField) storeWrapped(err error) {
+	w.Err = errutil.With(err)
+}
+
+func (w *exportedField) badExportedField() error {
+	return w.Err // want `error should be wrapped`
+}
+
+// Bad: the field's address escapes (passed to sinkErr), so a write could occur
+// through an unseen pointer even though all visible stores wrap (guard #2).
+type escapeField struct{ err error }
+
+func (w *escapeField) storeWrapped(err error) {
+	w.err = errutil.With(err)
+}
+
+func (w *escapeField) leak() {
+	sinkErr(&w.err)
+}
+
+func (w *escapeField) badEscapeField() error {
+	return w.err // want `error should be wrapped`
+}
+
 func exits() { os.Exit(1) }
 
 // Good (by construction): a return after a never-returning call is pruned as
